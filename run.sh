@@ -6,10 +6,10 @@
 #   MODEL=... GPU=1 PORT=8030 K=7 BIND=0.0.0.0 ./run.sh     # any vLLM flag can follow, e.g. ./run.sh --max-num-seqs 16
 #
 # MODEL  the downloaded thinkingmachines/Inkling-2-Mini folder (required)
-# GPU    GPU index or UUID as nvidia-smi shows it (default 0)
+# GPU    GPU index or UUID as nvidia-smi shows it, or a comma list for tensor parallel, e.g. 0,1 (default 0)
 # PORT   host port (default 8000); BIND host address (default 127.0.0.1; there is no API key)
 # K      DSpark draft tokens, 1-7 (default 4: best on chat, code, long context and several users; 7 for very
-#        predictable text)
+#        predictable text); 0 serves without the drafter
 # LEN    context length (default 262144)
 # CACHE  where compiled kernels are kept between runs (default ~/.cache/inkling2-sm80)
 # IMAGE  defaults to the image build these patches were made against (pinned by digest)
@@ -37,6 +37,12 @@ while IFS= read -r f; do
     mounts+=(-v "${HERE}/patches/vllm/${f}:${VLLM}/${f}:ro")
 done < <(cd "${HERE}/patches/vllm" && find . -name '*.py' | sed 's|^\./||' | sort)
 
+# K=0 serves without the DSpark drafter (frees its weights and KV for context).
+spec=()
+if [[ "${K}" != 0 ]]; then
+    spec=(--speculative-config "{\"method\":\"dspark\",\"num_speculative_tokens\":${K},\"draft_sample_method\":\"probabilistic\"}")
+fi
+
 exec docker run --rm --name "${NAME:-inkling2-sm80}" \
     --gpus "\"device=${GPU}\"" --ipc=host \
     -p "${BIND}:${PORT}:8000" \
@@ -44,7 +50,7 @@ exec docker run --rm --name "${NAME:-inkling2-sm80}" \
     -v "${CACHE}:/root/.cache" \
     -v "${HERE}/site:/sm80site:ro" \
     "${mounts[@]}" \
-    -e INKLING_SM80=1 -e PYTHONPATH=/sm80site \
+    -e INKLING_SM80=1 -e PYTHONPATH=/sm80site -e INKLING_SM80_TRACE="${INKLING_SM80_TRACE:-0}" \
     -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False \
     -e TRITON_CACHE_DIR=/root/.cache/triton -e HF_HUB_OFFLINE=1 \
     "${IMAGE}" /model \
@@ -56,5 +62,5 @@ exec docker run --rm --name "${NAME:-inkling2-sm80}" \
     --enable-auto-tool-choice --tool-call-parser inkling \
     --max-num-batched-tokens 8192 \
     --max-num-seqs 8 \
-    --speculative-config "{\"method\":\"dspark\",\"num_speculative_tokens\":${K},\"draft_sample_method\":\"probabilistic\"}" \
+    ${spec[@]+"${spec[@]}"} \
     "$@"

@@ -10,7 +10,7 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.flashinfer import is_flashinfer_autotuning
 
 from . import use_sm100_kernels
-from .gemv import sm12x_bf16_gemv, use_sm12x_bf16_gemv
+from .gemv import sm12x_bf16_gemv, small_smem, use_sm12x_bf16_gemv
 
 # Up to this many rows, FlashInfer's CuTe DSL low-M kernels run near HBM
 # bandwidth (cuBLAS is up to 2x slower); larger batches use cuBLAS.
@@ -244,7 +244,7 @@ def k_group_partials(
     split = groups > 1 and tokens < 4096
     num_warps = 4 if block_n <= 64 else 8
     num_stages = 4 if not split else 3 if block_n <= 64 else 2
-    if sm120:
+    if sm120 or small_smem():
         num_stages = min(num_stages, 2)
     out = torch.empty(
         (groups if split else 1, tokens, n),

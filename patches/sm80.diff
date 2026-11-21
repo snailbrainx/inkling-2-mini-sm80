@@ -8,7 +8,22 @@
  from .ops.linear import linear
  from .ops.sconv import attention_prologue, shift_rel_proj
  from .sconv import K_STREAM, V_STREAM, Inkling2ShortConv, conv_metadata
-@@ -339,6 +340,15 @@
+@@ -293,9 +294,13 @@
+         supported: tuple[str, ...] = ("auto", "bfloat16")
+         if current_platform.is_device_capability_family(120):
+             supported += ("float16", "fp8", "fp8_e4m3")
++        if not current_platform.has_device_capability(89):
++            # sm_80/sm_86: no E4M3 conversion instructions; E5M2 is the top byte of an fp16 and decodes with a shift.
++            supported += ("fp8_e5m2",)
+         if cache_dtype not in supported:
+             raise ValueError(f"Inkling2 KV cache dtype must be one of {supported}")
+-        self.fp8_kv = cache_dtype in ("fp8", "fp8_e4m3")
++        self.fp8_kv = cache_dtype in ("fp8", "fp8_e4m3", "fp8_e5m2")
++        self.fp8_kv_dtype = torch.float8_e5m2 if cache_dtype == "fp8_e5m2" else torch.float8_e4m3fn
+         if cache_dtype == "float16" and vllm_config.speculative_config is not None:
+             raise ValueError("Inkling2 FP16 KV requires speculative decoding disabled")
+         self.kv_cache = torch.tensor([])
+@@ -339,6 +344,15 @@
              return list(projected.split(self.split_sizes, dim=-1)[:6])
          q_side, kv_size = sum(self.split_sizes[:4]), self.split_sizes[4]
          k_end = q_side + kv_size
@@ -24,6 +39,17 @@
          projected = linear(x_q, weight[: sum(self.q_side_splits)])
          k = linear(x_k, weight[q_side:k_end])
          v = linear(x_v, weight[k_end : k_end + kv_size])
+@@ -351,8 +365,8 @@
+         self, kv_cache: torch.Tensor
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+         if self.fp8_kv:
+-            # Every loop pass owns byte storage containing unit-scale E4M3 KV.
+-            kv_cache = kv_cache.view(torch.float8_e4m3fn)
++            # Every loop pass owns byte storage containing unit-scale E4M3 (E5M2 on sm_8x) KV.
++            kv_cache = kv_cache.view(self.fp8_kv_dtype)
+         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_dim, dim=-1)
+         return (
+             canonicalize_singleton_dim_strides(key_cache),
 --- a/vllm/models/inkling2/nvidia/dspark.py
 +++ b/vllm/models/inkling2/nvidia/dspark.py
 @@ -28,6 +28,7 @@
@@ -107,7 +133,28 @@
  
 --- a/vllm/models/inkling2/nvidia/ops/attention_sm90.py
 +++ b/vllm/models/inkling2/nvidia/ops/attention_sm90.py
-@@ -150,7 +150,38 @@
+@@ -18,6 +18,8 @@
+ 
+ from vllm.triton_utils import tl, triton
+ 
++from .gemv import small_smem
++
+ # The query tile of tml_fa4 that shears the relative logits.
+ _SHEAR_TILE = tl.constexpr(128)
+ 
+@@ -36,6 +38,11 @@
+ 
+ @triton.jit
+ def _load_fp8_kv(ptr, offsets, mask, dtype: tl.constexpr, D: tl.constexpr):
++    if ptr.dtype.element_ty == tl.float8e5:
++        # sm_80/sm_86 E5M2 cache: each byte is the high byte of an fp16, so a shift decodes it exactly.
++        raw = tl.load(ptr.to(tl.pointer_type(tl.uint8)) + offsets[:, None] + tl.arange(0, D)[None, :],
++                      mask=mask[:, None], other=0)
++        return (raw.to(tl.uint16) << 8).to(tl.float16, bitcast=True).to(dtype)
+     # Load each E4M3 pair once, retaining 16-bit packing for BF16 MMA order.
+     half = tl.arange(0, D // 2)
+     pair = tl.load(
+@@ -150,7 +157,38 @@
      acc = tl.zeros([BLOCK_M, D], tl.float32)
      block_table = BlockTable + req.to(tl.int64) * stride_bt
      kv_off = kv_head * stride_kv_h
@@ -147,7 +194,7 @@
          n = n_lo + split + i * num_splits
          keys = n * BLOCK_N + tl.arange(0, BLOCK_N)
          key_valid = keys < seqlen_k
-@@ -337,7 +368,10 @@
+@@ -337,7 +375,12 @@
          DRAFT=draft,
          MODE=mode,
          BLOCK_M=block_m,
@@ -157,9 +204,11 @@
 +        # sm_80 (Ampere): for the 128-row prefill tiles, full layers take 32-key blocks with 4 warps
 +        # (~9% faster at 120k-250k of context, with the far-block loop above) and window layers 64-key blocks,
 +        # 8 warps, 3 stages (2.15-2.40 ms an 8k chunk against 2.45-2.88); the other tiles as before.
-+        BLOCK_N=(64 if window else 32) if block_m >= 128 else 128 if block_m <= 32 else 64,
-+        num_warps=(8 if window else 4) if block_m >= 128 else 4,
-+        num_stages=3 if (window and block_m >= 128) else 2,
++        # sm_86 / sm_89 (~100 KB shared memory): 32-key prefill tiles, at most 64 keys otherwise, 2 stages.
++        BLOCK_N=(32 if block_m >= 128 else 64) if small_smem()
++        else (64 if window else 32) if block_m >= 128 else 128 if block_m <= 32 else 64,
++        num_warps=4 if small_smem() else (8 if window else 4) if block_m >= 128 else 4,
++        num_stages=2 if small_smem() else 3 if (window and block_m >= 128) else 2,
      )
 --- a/vllm/models/inkling2/nvidia/ops/conv_mix.py
 +++ b/vllm/models/inkling2/nvidia/ops/conv_mix.py
@@ -177,7 +226,31 @@
              short_conv(
 --- a/vllm/models/inkling2/nvidia/ops/gemv.py
 +++ b/vllm/models/inkling2/nvidia/ops/gemv.py
-@@ -54,6 +54,163 @@
+@@ -2,6 +2,8 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Low-M BF16 tensor-core projections for SM120/SM121."""
+ 
++import functools
++
+ import torch
+ 
+ from vllm.platforms import current_platform
+@@ -11,6 +13,14 @@
+ _BN, _BK = 32, 256
+ 
+ 
++@functools.cache
++def small_smem() -> bool:
++    """sm_86 / sm_89 (consumer Ampere / Ada): ~100 KB of shared memory per block against 164 KB on sm_80, so the
++    sm_80-tuned Triton and Humming tiles do not fit; those callers fall back to <=2-stage or heuristic tiles."""
++    props = torch.cuda.get_device_properties(torch.cuda.current_device())
++    return props.shared_memory_per_block_optin < 150_000
++
++
+ @triton.jit
+ def _gemv_kernel(
+     X,
+@@ -54,6 +64,163 @@
      )
  
  
@@ -186,7 +259,7 @@
 +# Measured with cold weights (cycled past the 40 MB L2, as in the model).
 +def _sm80_tiles(n: int, k: int) -> tuple[int, int, int, int]:
 +    if n >= 65536:  # vocab heads; the draft's Markov fold has K=256
-+        return (64, 64, 2, 3) if k <= 512 else (64, 256, 2, 4)
++        return (64, 64, 2, 3) if k <= 512 else (64, 256, 2, 2 if small_smem() else 4)
 +    if n <= 1024:
 +        return 16, 256, 2, 3
 +    if n >= 16384:
@@ -341,7 +414,7 @@
  def sm12x_bf16_gemv(
      x: torch.Tensor,
      weight: torch.Tensor,
-@@ -68,8 +225,11 @@
+@@ -68,8 +235,11 @@
      n = weight.shape[0]
      if out is None:
          out = torch.empty((m, n), device=x.device, dtype=out_dtype or x.dtype)
@@ -354,7 +427,7 @@
              x2,
              weight,
              bias,
-@@ -81,10 +241,11 @@
+@@ -81,10 +251,11 @@
              weight.stride(0),
              out.stride(0),
              HAS_BIAS=bias is not None,
@@ -369,7 +442,7 @@
          )
      return out.view(*lead, n)
  
-@@ -109,5 +270,9 @@
+@@ -109,5 +280,9 @@
                  and bias.stride(0) == 1
              )
          )
@@ -382,6 +455,15 @@
      )
 --- a/vllm/models/inkling2/nvidia/ops/linear.py
 +++ b/vllm/models/inkling2/nvidia/ops/linear.py
+@@ -10,7 +10,7 @@
+ from vllm.utils.flashinfer import is_flashinfer_autotuning
+ 
+ from . import use_sm100_kernels
+-from .gemv import sm12x_bf16_gemv, use_sm12x_bf16_gemv
++from .gemv import sm12x_bf16_gemv, small_smem, use_sm12x_bf16_gemv
+ 
+ # Up to this many rows, FlashInfer's CuTe DSL low-M kernels run near HBM
+ # bandwidth (cuBLAS is up to 2x slower); larger batches use cuBLAS.
 @@ -214,7 +214,9 @@
      tokens, hidden = x.shape
      n = weight.shape[0]
@@ -393,9 +475,18 @@
          from triton.tools.tensor_descriptor import TensorDescriptor
  
          out = torch.empty((1, tokens, n), dtype=out_dtype, device=x.device)
+@@ -242,7 +244,7 @@
+     split = groups > 1 and tokens < 4096
+     num_warps = 4 if block_n <= 64 else 8
+     num_stages = 4 if not split else 3 if block_n <= 64 else 2
+-    if sm120:
++    if sm120 or small_smem():
+         num_stages = min(num_stages, 2)
+     out = torch.empty(
+         (groups if split else 1, tokens, n),
 --- a/vllm/models/inkling2/nvidia/ops/moe_sm90.py
 +++ b/vllm/models/inkling2/nvidia/ops/moe_sm90.py
-@@ -9,14 +9,29 @@
+@@ -9,17 +9,33 @@
  """
  
  import json
@@ -426,19 +517,26 @@
  from vllm.triton_utils import tl, triton
  
  from .activation import _situ
-@@ -229,6 +244,15 @@
++from .gemv import small_smem
+ from .linear import k_group_partials
+ from .moe import _load_bias, _local_experts, _select_experts
+ 
+@@ -229,6 +245,18 @@
              # whose order (and so the result) changes from run to run.
              for _, _, kernel_config in tuning:
                  kernel_config["use_stream_k"] = False
 +            # sm_80 (Ampere): measured sweep (block n/k, stages, CTAs per SM, 192 configs) at decode sizes
 +            # (16-912 routed rows: drafts of 3-7 tokens for 1-8 users): 8x256x128 tiles, 4 stages, 2 CTAs per SM were
 +            # 5-14% faster than the heuristic configs. INKLING_SM80_HUMMING (JSON) overrides it; prefill sizes untouched.
++            # sm_86 / sm_89: that tile needs ~150 KB per SM; keep Humming's own heuristics there unless overridden.
 +            if not current_platform.has_device_capability(90):
-+                override = json.loads(os.environ.get("INKLING_SM80_HUMMING") or "null") or {
-+                    "block_shape": [8, 256, 128], "warp_shape": [8, 64, 64], "num_stages": 4, "num_ctas_per_sm": 2}
-+                for lower, upper, kernel_config in tuning:
-+                    if lower >= 16 and upper <= 912:
-+                        kernel_config.update(override)
++                override = json.loads(os.environ.get("INKLING_SM80_HUMMING") or "null")
++                if not override and not small_smem():
++                    override = {"block_shape": [8, 256, 128], "warp_shape": [8, 64, 64], "num_stages": 4, "num_ctas_per_sm": 2}
++                if override:
++                    for lower, upper, kernel_config in tuning:
++                        if lower >= 16 and upper <= 912:
++                            kernel_config.update(override)
              self.configs[name] = config
              self.tensors[name] = tensors
              self.tunings[name] = tuning
@@ -455,3 +553,19 @@
  
      @staticmethod
      def get_config_filenames() -> list[str]:
+--- a/vllm/models/inkling2/speculator_config.py
++++ b/vllm/models/inkling2/speculator_config.py
+@@ -15,10 +15,11 @@
+     @classmethod
+     def adapt_draft_model_config(cls, spec: "SpeculativeConfig") -> None:
+         super().adapt_draft_model_config(spec)
+-        if current_platform.is_device_capability_family(120):
++        # sm_80/sm_86 too: the draft's KV write (reshape_and_cache_flash stand-in) handles BF16 only.
++        if current_platform.is_device_capability_family(120) or not current_platform.has_device_capability(90):
+             # The target's clipped, unit-scale FP8 cache does not describe the
+             # draft's unnormalized values. Keep the draft cache in BF16.
+             if spec.kv_cache_dtype is None:
+                 spec.kv_cache_dtype = "auto"
+             elif spec.kv_cache_dtype not in ("auto", "bfloat16"):
+-                raise ValueError("Inkling2 DSpark on SM12 requires BF16 draft KV")
++                raise ValueError("Inkling2 DSpark on SM12 and below SM90 requires BF16 draft KV")

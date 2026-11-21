@@ -8,7 +8,9 @@ The model is served by vLLM's own image `vllm/vllm-openai:inkling-2-mini`. That 
 Nothing is compiled or installed, and the image itself is not modified.
 
 Tested on an NVIDIA CMP 170HX: a GA100 (the A100's chip), sm_80, 64 GB, power-capped at 180 W. It should behave the same
-on an A100 (also sm_80), but that is untested. Other Ampere chips (sm_86 / sm_89) are untested too.
+on an A100 (also sm_80), but that is untested. Also tested on 2x RTX 3090 (sm_86, 24 GB each) with
+`--tensor-parallel-size 2 --disable-custom-all-reduce`: one 24 GB card holds the weights but has no room left for KV.
+sm_89 is untested.
 
 ## Quick start
 
@@ -32,9 +34,9 @@ later starts take about two minutes.
 | Variable | Default | Meaning |
 |---|---|---|
 | `MODEL` | (required) | the downloaded model folder |
-| `GPU` | `0` | GPU index or UUID |
+| `GPU` | `0` | GPU index or UUID; a comma list (`0,1`) for tensor parallel |
 | `PORT` / `BIND` | `8000` / `127.0.0.1` | where the OpenAI-compatible API listens. There is no API key, so only bind to `0.0.0.0` on a trusted network |
-| `K` | `4` | how many tokens the DSpark drafter proposes per step (1-7), see below |
+| `K` | `4` | how many tokens the DSpark drafter proposes per step (1-7), see below; `0` serves without the drafter (frees its weights and KV for context) |
 | `LEN` | `262144` | context length |
 | `IMAGE` | the tested build, pinned by digest | the patches replace whole files of that build |
 | `NAME` | `inkling2-sm80` | container name, to run several at once |
@@ -43,6 +45,19 @@ Any extra arguments are passed to `vllm serve`, e.g. `./run.sh --max-num-seqs 16
 
 Thinking is controlled through the chat template: `"chat_template_kwargs": {"reasoning_effort": "none"}` turns it
 off. Even then, as the model card notes, the model still reasons briefly.
+
+**2x RTX 3090 (sm_86, 24 GB each).** One card holds the weights but has no room for KV, so split the model over two
+with tensor parallel. Smaller prefill chunks shrink the per-request window and conv reservations, and the FP8 E5M2 KV
+cache halves attention KV; together they give 4 users x 256K:
+
+```bash
+MODEL=~/models/Inkling-2-Mini GPU=0,1 ./run.sh --tensor-parallel-size 2 --disable-custom-all-reduce \
+  --max-num-batched-tokens 512 --gpu-memory-utilization 0.985 --max-num-seqs 4 --kv-cache-dtype fp8_e5m2
+```
+
+For one long context instead: `K=0 LEN=1048576` with `--max-num-seqs 1` and the same other flags (the model's native
+1M), or BF16 KV with DSpark up to `LEN=409600` (`--max-num-batched-tokens 1024 --gpu-memory-utilization 0.97
+--max-num-seqs 1`).
 
 ## Results
 
@@ -103,11 +118,17 @@ k=4 is the best all-rounder: chat, code, long context and several users. k=7 onl
   empty, and launches run without PDL.
 - **Compiled ops without sm_80 kernels.** The image's `_C`, `_C_cache_ops` and `_moe_C` libraries are built for
   sm_100. On sm_80, an op with no kernel launches nothing and leaves `cudaErrorNoKernelImageForDevice` behind for some
-  later call to report, far from the cause. Two such ops matter here: `moe_align_block_size` (expert routing) and
-  `reshape_and_cache_flash` (the drafter's KV cache). Both now have Triton versions: `site/inkling_sm80_moe_align.py`,
-  wired in by `ops/moe_sm90.py`, and `site/inkling_sm80_ops.py`, registered at the PyTorch dispatcher. Set
-  `INKLING_SM80_TRACE=1` to wrap every compiled op and log the first one that leaves a CUDA error. That is how these
-  two were found.
+  later call to report, far from the cause. Three such ops matter here: `moe_align_block_size` (expert routing),
+  `reshape_and_cache_flash` (the drafter's KV cache) and, with tensor parallel, `vocab_parallel_embedding`. All now
+  have stand-ins: `site/inkling_sm80_moe_align.py`, wired in by `ops/moe_sm90.py`, and `site/inkling_sm80_ops.py`
+  (Triton / torch), registered at the PyTorch dispatcher. Set `INKLING_SM80_TRACE=1` to wrap every compiled op and log
+  the first one that leaves a CUDA error. That is how these were found.
+- **sm_86 / sm_89 shared memory** (~100 KB per block against 164 KB on sm_80): `small_smem()` in `ops/gemv.py`
+  caps the sm_80-tuned tiles there (vocab GEMV and `k_group_partials` to 2 stages, smaller `rel_attention` tiles) and
+  skips the Humming decode override. On sm_80 it is false and nothing changes.
+- **FP8 E5M2 KV cache** (`attention.py`, `ops/attention_sm90.py`, `speculator_config.py`): the image allows FP8 KV
+  only on SM12x and decodes E4M3 with an sm_89+ instruction. E5M2 is the high byte of an fp16, so it decodes with a
+  shift on sm_80 / sm_86. The DSpark draft cache stays bf16 (its KV-write stand-in is bf16 only).
 
 **Making it fast** (each change is exact up to the order of bf16 rounding):
 
@@ -153,7 +174,8 @@ vLLM torch-profiler trace: start the server with `--profiler-config`, then POST 
 ## Limits
 
 - Text only (`--language-model-only`); the vision tower has not been tried on sm_80.
-- The KV cache is bf16. The FP8 KV path in this code is SM12x only.
+- The KV cache is bf16 by default. On sm_80 / sm_86, `--kv-cache-dtype fp8_e5m2` halves it (E5M2 decodes with a shift;
+  the image's E4M3 path needs sm_89+ instructions); the DSpark draft cache stays bf16. FP8 E4M3 remains SM12x only.
 - Outputs match the reference up to bf16 rounding order. Greedy answers agree, though wording can drift after a few
   hundred tokens, as with any change of kernels.
 - Made against the image build of 20 Nov 2026 (vLLM `0.1.dev25855+g7cb5dae22`). Expect to redo the patches when that

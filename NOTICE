@@ -17,6 +17,7 @@ NVIDIA sm_80 (Ampere) GPUs and to run faster there; patches/sm80.diff shows ever
   models/inkling2/nvidia/ops/gemv.py
   models/inkling2/nvidia/ops/linear.py
   models/inkling2/nvidia/ops/moe_sm90.py
+  models/inkling2/speculator_config.py
 
 The Triton kernels in site/inkling_sm80_ops.py and site/inkling_sm80_moe_align.py are written
 for this repository and reproduce the behaviour of the corresponding vLLM operations.
