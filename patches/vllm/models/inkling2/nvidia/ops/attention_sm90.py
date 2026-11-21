@@ -38,6 +38,11 @@ def _sigmoid(x):
 
 @triton.jit
 def _load_fp8_kv(ptr, offsets, mask, dtype: tl.constexpr, D: tl.constexpr):
+    if ptr.dtype.element_ty == tl.float8e5:
+        # sm_80/sm_86 E5M2 cache: each byte is the high byte of an fp16, so a shift decodes it exactly.
+        raw = tl.load(ptr.to(tl.pointer_type(tl.uint8)) + offsets[:, None] + tl.arange(0, D)[None, :],
+                      mask=mask[:, None], other=0)
+        return (raw.to(tl.uint16) << 8).to(tl.float16, bitcast=True).to(dtype)
     # Load each E4M3 pair once, retaining 16-bit packing for BF16 MMA order.
     half = tl.arange(0, D // 2)
     pair = tl.load(

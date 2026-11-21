@@ -294,9 +294,13 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         supported: tuple[str, ...] = ("auto", "bfloat16")
         if current_platform.is_device_capability_family(120):
             supported += ("float16", "fp8", "fp8_e4m3")
+        if not current_platform.has_device_capability(89):
+            # sm_80/sm_86: no E4M3 conversion instructions; E5M2 is the top byte of an fp16 and decodes with a shift.
+            supported += ("fp8_e5m2",)
         if cache_dtype not in supported:
             raise ValueError(f"Inkling2 KV cache dtype must be one of {supported}")
-        self.fp8_kv = cache_dtype in ("fp8", "fp8_e4m3")
+        self.fp8_kv = cache_dtype in ("fp8", "fp8_e4m3", "fp8_e5m2")
+        self.fp8_kv_dtype = torch.float8_e5m2 if cache_dtype == "fp8_e5m2" else torch.float8_e4m3fn
         if cache_dtype == "float16" and vllm_config.speculative_config is not None:
             raise ValueError("Inkling2 FP16 KV requires speculative decoding disabled")
         self.kv_cache = torch.tensor([])
@@ -361,8 +365,8 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         self, kv_cache: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.fp8_kv:
-            # Every loop pass owns byte storage containing unit-scale E4M3 KV.
-            kv_cache = kv_cache.view(torch.float8_e4m3fn)
+            # Every loop pass owns byte storage containing unit-scale E4M3 (E5M2 on sm_8x) KV.
+            kv_cache = kv_cache.view(self.fp8_kv_dtype)
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_dim, dim=-1)
         return (
             canonicalize_singleton_dim_strides(key_cache),
