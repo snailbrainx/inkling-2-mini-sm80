@@ -18,6 +18,8 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
+from .gemv import small_smem
+
 # The query tile of tml_fa4 that shears the relative logits.
 _SHEAR_TILE = tl.constexpr(128)
 
@@ -371,7 +373,9 @@ def rel_attention(
         # sm_80 (Ampere): for the 128-row prefill tiles, full layers take 32-key blocks with 4 warps
         # (~9% faster at 120k-250k of context, with the far-block loop above) and window layers 64-key blocks,
         # 8 warps, 3 stages (2.15-2.40 ms an 8k chunk against 2.45-2.88); the other tiles as before.
-        BLOCK_N=(64 if window else 32) if block_m >= 128 else 128 if block_m <= 32 else 64,
-        num_warps=(8 if window else 4) if block_m >= 128 else 4,
-        num_stages=3 if (window and block_m >= 128) else 2,
+        # sm_86 / sm_89 (~100 KB shared memory): 32-key prefill tiles, at most 64 keys otherwise, 2 stages.
+        BLOCK_N=(32 if block_m >= 128 else 64) if small_smem()
+        else (64 if window else 32) if block_m >= 128 else 128 if block_m <= 32 else 64,
+        num_warps=4 if small_smem() else (8 if window else 4) if block_m >= 128 else 4,
+        num_stages=2 if small_smem() else 3 if (window and block_m >= 128) else 2,
     )

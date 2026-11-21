@@ -4,8 +4,9 @@ The image's _C / _C_cache_ops / _moe_C libraries carry sm_100 code for nearly ev
 some MoE kernels exist), so such an op launches nothing on sm_80 and leaves cudaErrorNoKernelImageForDevice behind.
 The image's vLLM commit is not public, so the libraries cannot be rebuilt; instead each op the Inkling 2 Mini path
 reaches is re-registered here for the CUDA dispatch key, so every caller (eager, torch.compile, CUDA graphs) gets it.
-Found with INKLING_SM80_TRACE=1 (sitecustomize): on start-up and decode only reshape_and_cache_flash (the DSpark
-drafter's KV write) was hit; moe_align_block_size is replaced in the patched moe_sm90.py instead.
+Found with INKLING_SM80_TRACE=1 (sitecustomize): on start-up and decode reshape_and_cache_flash (the DSpark drafter's
+KV write) was hit, and with tensor parallel also vocab_parallel_embedding; moe_align_block_size is replaced in the
+patched moe_sm90.py instead.
 """
 import torch
 import triton
@@ -45,6 +46,18 @@ def reshape_and_cache_flash(key, value, key_cache, value_cache, slot_mapping, kv
         BLOCK_SIZE=key_cache.shape[1], D=dim, DP=triton.next_power_of_2(dim), num_warps=1)
 
 
+def vocab_parallel_embedding(out, input_ids, weight, org_start, org_end, num_org_padding, added_start, added_end):
+    # TP > 1 only: rows this rank owns, zeros elsewhere (the all-reduce sums the ranks). Same index mapping as
+    # vllm's get_masked_input_and_mask; plain torch ops, which carry sm_80/sm_86 kernels and are graph-capturable.
+    ids = input_ids.reshape(-1).long()
+    org = (ids >= org_start) & (ids < org_end)
+    added = (ids >= added_start) & (ids < added_end)
+    local = torch.where(org, ids - org_start,
+                        torch.where(added, ids - added_start + (org_end - org_start) + num_org_padding, 0))
+    rows = weight.index_select(0, local)
+    out.view(-1, weight.shape[1]).copy_(torch.where((org | added).unsqueeze(1), rows, 0))
+
+
 _LIBS = []
 
 
@@ -53,3 +66,7 @@ def install():
     lib.impl("reshape_and_cache_flash", reshape_and_cache_flash, "CUDA")
     _LIBS.append(lib)  # keep the registration alive
     print("[sm80] reshape_and_cache_flash -> Triton stand-in", flush=True)
+    lib_c = torch.library.Library("_C", "IMPL")
+    lib_c.impl("vocab_parallel_embedding", vocab_parallel_embedding, "CUDA")
+    _LIBS.append(lib_c)
+    print("[sm80] vocab_parallel_embedding -> torch stand-in", flush=True)

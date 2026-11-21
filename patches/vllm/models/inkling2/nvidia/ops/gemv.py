@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Low-M BF16 tensor-core projections for SM120/SM121."""
 
+import functools
+
 import torch
 
 from vllm.platforms import current_platform
@@ -9,6 +11,14 @@ from vllm.triton_utils import tl, triton
 
 MAX_M = 16
 _BN, _BK = 32, 256
+
+
+@functools.cache
+def small_smem() -> bool:
+    """sm_86 / sm_89 (consumer Ampere / Ada): ~100 KB of shared memory per block against 164 KB on sm_80, so the
+    sm_80-tuned Triton and Humming tiles do not fit; those callers fall back to <=2-stage or heuristic tiles."""
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    return props.shared_memory_per_block_optin < 150_000
 
 
 @triton.jit
@@ -59,7 +69,7 @@ def _gemv_kernel(
 # Measured with cold weights (cycled past the 40 MB L2, as in the model).
 def _sm80_tiles(n: int, k: int) -> tuple[int, int, int, int]:
     if n >= 65536:  # vocab heads; the draft's Markov fold has K=256
-        return (64, 64, 2, 3) if k <= 512 else (64, 256, 2, 4)
+        return (64, 64, 2, 3) if k <= 512 else (64, 256, 2, 2 if small_smem() else 4)
     if n <= 1024:
         return 16, 256, 2, 3
     if n >= 16384:

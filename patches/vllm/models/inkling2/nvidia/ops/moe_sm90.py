@@ -35,6 +35,7 @@ def moe_align_block_size(ids, block_size, num_experts, ignore_invalid_experts=Fa
 from vllm.triton_utils import tl, triton
 
 from .activation import _situ
+from .gemv import small_smem
 from .linear import k_group_partials
 from .moe import _load_bias, _local_experts, _select_experts
 
@@ -247,12 +248,15 @@ class HummingExperts:
             # sm_80 (Ampere): measured sweep (block n/k, stages, CTAs per SM, 192 configs) at decode sizes
             # (16-912 routed rows: drafts of 3-7 tokens for 1-8 users): 8x256x128 tiles, 4 stages, 2 CTAs per SM were
             # 5-14% faster than the heuristic configs. INKLING_SM80_HUMMING (JSON) overrides it; prefill sizes untouched.
+            # sm_86 / sm_89: that tile needs ~150 KB per SM; keep Humming's own heuristics there unless overridden.
             if not current_platform.has_device_capability(90):
-                override = json.loads(os.environ.get("INKLING_SM80_HUMMING") or "null") or {
-                    "block_shape": [8, 256, 128], "warp_shape": [8, 64, 64], "num_stages": 4, "num_ctas_per_sm": 2}
-                for lower, upper, kernel_config in tuning:
-                    if lower >= 16 and upper <= 912:
-                        kernel_config.update(override)
+                override = json.loads(os.environ.get("INKLING_SM80_HUMMING") or "null")
+                if not override and not small_smem():
+                    override = {"block_shape": [8, 256, 128], "warp_shape": [8, 64, 64], "num_stages": 4, "num_ctas_per_sm": 2}
+                if override:
+                    for lower, upper, kernel_config in tuning:
+                        if lower >= 16 and upper <= 912:
+                            kernel_config.update(override)
             self.configs[name] = config
             self.tensors[name] = tensors
             self.tunings[name] = tuning
