@@ -260,7 +260,9 @@ def _conv(
         + (safe_slot % N)[:, None] * stride_c_n
         + cache_col[None, :]
     )
-    tl.store(dst, cur, mask=tc_mask & valid[:, None])
+    # Slots in block 0 (the null block: conv-tail rows below the chunk's tail) are
+    # never read; skipping them keeps a whole chunk from writing the same lines.
+    tl.store(dst, cur, mask=tc_mask & (valid & (slot >= N))[:, None])
 
     tap_args = (
         x_ptr,

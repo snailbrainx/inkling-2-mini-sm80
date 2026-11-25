@@ -121,7 +121,7 @@ void sm80_conv_mix_2304_kernel(
     const int32_t qstart = QueryStart[t];
 
     uint4 cur_u4 = __ldg(reinterpret_cast<const uint4*>(X + (int64_t)t * stride_x + c0));
-    if (valid) {
+    if (valid && slot >= cache_N) {  // block 0 = null block (conv tail): never read
         int64_t dst_off = (slot / cache_N) * stride_c_blk + (slot % cache_N) * stride_c_n + cache_col;
         *reinterpret_cast<uint4*>(Cache + dst_off) = cur_u4;
     }
@@ -394,7 +394,7 @@ void sm80_conv_mix_576_kernel(
     const int32_t qstart = QueryStart[t];
 
     uint2 cur_u2 = __ldg(reinterpret_cast<const uint2*>(X + (int64_t)t * stride_x + c0));
-    if (valid) {
+    if (valid && slot >= cache_N) {  // block 0 = null block (conv tail): never read
         int64_t dst_off = (slot / cache_N) * stride_c_blk + (slot % cache_N) * stride_c_n + cache_col;
         *reinterpret_cast<uint2*>(Cache + dst_off) = cur_u2;
     }
@@ -656,7 +656,7 @@ void sm80_prefill_conv_mix_2304_kernel(
     const int32_t qstart = QueryStart[t];
 
     uint4 cur_u4 = __ldg(reinterpret_cast<const uint4*>(X + (int64_t)t * stride_x + c0));
-    if (valid) {
+    if (valid && slot >= cache_N) {  // block 0 = null block (conv tail): never read
         int64_t dst_off = (slot / cache_N) * stride_c_blk + (slot % cache_N) * stride_c_n + cache_col;
         *reinterpret_cast<uint4*>(Cache + dst_off) = cur_u4;
     }

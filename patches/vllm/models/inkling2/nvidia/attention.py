@@ -3,6 +3,7 @@
 """Inkling2 attention: relative-bias GQA with short-conv K/V, L2-clipped
 q/k/r, gated output and per-token attention sinks."""
 
+import os
 from dataclasses import dataclass, field
 from functools import partial
 from typing import cast
@@ -43,6 +44,7 @@ from vllm.v1.attention.backends.flash_attn import (
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.core.single_type_kv_cache_manager import (
+    DFlashSlidingWindowManager,
     FullAttentionManager,
     SlidingWindowManager,
 )
@@ -68,6 +70,155 @@ from .ops.gemv import sm80_seg3_dyn_gemv, sm80_seg3_gemv
 from .ops.linear import linear
 from .ops.sconv import attention_prologue, shift_rel_proj
 from .sconv import K_STREAM, V_STREAM, Inkling2ShortConv, conv_metadata
+
+
+class InklingConvTailManager(DFlashSlidingWindowManager):
+    """Conv-state cache that backs only each chunk's tail (sm_80 serving).
+
+    The short convolutions read taps inside a forward from its own inputs and
+    only the `kernel - 1` positions before the forward's first token from the
+    cache (`ops/sconv.py`). As plain sliding window, every chunk still backs a
+    block for each of its tokens, which for a 12k-token prefill chunk holds
+    ~70% of the pool across the 48 conv caches. Like the DFlash drafter KV,
+    blocks below the tail (window plus in-flight drafts) stay null; writes to
+    them land in the null block and are never read. Prefix hits keep the plain
+    sliding-window rule: a hit at `h` recomputes from `h`, whose taps read the
+    window before `h`.
+    """
+
+    find_longest_cache_hit = classmethod(
+        SlidingWindowManager.find_longest_cache_hit.__func__
+    )
+    reachable_block_mask = classmethod(
+        SlidingWindowManager.reachable_block_mask.__func__
+    )
+
+    # Also backed: the window below each position `cache_blocks` keeps a tail
+    # for, so prefix hits match plain sliding window. These are the replay
+    # boundaries (a resend of the same prompt resumes just below its end, which
+    # can sit under the tail) and a shared-prefix junction the scheduler pinned
+    # (`Request.shared_prefix_boundary`, on the second request sharing a prompt
+    # prefix). With only tails backed, neither state was written, so a resend
+    # or a third chat sharing a system prompt recomputed it all.
+    # req_id -> boundaries; set by the `KVCacheManager.allocate_slots` wrapper.
+    _boundaries: dict[str, tuple[int, ...]] = {}
+
+    @classmethod
+    def max_admission_blocks(cls, config, block_size, max_in_flight_tokens, max_model_len):
+        n = super().max_admission_blocks(
+            config, block_size, max_in_flight_tokens, max_model_len
+        )
+        # Up to three boundaries (two replay, one junction) can need a window.
+        return n + 3 * cls._contiguous_blocks_for_hit(
+            config.params.sliding_window, block_size, use_eagle=True
+        )
+
+    def _boundary_blocks(self, request_id: str, lo: int, hi: int) -> list[int]:
+        # The tails `reachable_block_mask` marks for each boundary.
+        align = self.cache_hit_alignment_tokens or self.block_size
+        need = self._contiguous_blocks_for_hit(
+            self.manager_config.params.sliding_window, self.block_size, self.use_eagle
+        )
+        out: set[int] = set()
+        for boundary in self._boundaries.get(request_id, ()):
+            end = boundary // align * align // self.block_size + int(self.use_eagle)
+            out.update(range(max(end - need, lo), min(end, hi)))
+        return sorted(out)
+
+    def get_num_blocks_to_allocate(
+        self,
+        request_id,
+        num_tokens,
+        new_computed_blocks,
+        total_computed_tokens,
+        num_local_computed_tokens,
+        num_tokens_main_model,
+        apply_admission_cap=False,
+        prefill_end=0,
+    ) -> int:
+        n = super().get_num_blocks_to_allocate(
+            request_id,
+            num_tokens,
+            new_computed_blocks,
+            total_computed_tokens,
+            num_local_computed_tokens,
+            num_tokens_main_model,
+            apply_admission_cap=apply_admission_cap,
+            prefill_end=prefill_end,
+        )
+        held = len(self.req_to_blocks.get(request_id, ())) + len(new_computed_blocks)
+        unbacked = self._num_unbacked_leading_blocks(num_tokens_main_model)
+        return n + len(self._boundary_blocks(request_id, held, unbacked))
+
+    def allocate_new_blocks(
+        self, request_id: str, num_tokens: int, num_tokens_main_model: int
+    ) -> list:
+        start = len(self.req_to_blocks.get(request_id, ()))
+        out = super().allocate_new_blocks(request_id, num_tokens, num_tokens_main_model)
+        blocks = self.req_to_blocks[request_id]
+        pick = [
+            i
+            for i in self._boundary_blocks(request_id, start, len(blocks))
+            if blocks[i].is_null
+        ]
+        if pick:
+            # The new entries start with the nulls, in block-table order.
+            new = self.block_pool.get_new_blocks(len(pick))
+            for i, block in zip(pick, new):
+                blocks[i] = block
+                out[i - start] = block
+            if self._record_new_block_ids:
+                self.new_block_ids.extend(b.block_id for b in new)
+        return out
+
+    def pop_blocks_for_free(self, request_id: str):
+        self._boundaries.pop(request_id, None)
+        return super().pop_blocks_for_free(request_id)
+
+
+def _conv_tail_allocate_slots(self, request, *args, **kwargs):
+    from vllm.v1.core.kv_cache_coordinator import replay_boundaries
+
+    co = self.coordinator
+    boundaries = replay_boundaries(
+        request.num_prompt_tokens,
+        co.scheduler_block_size,
+        use_eagle=bool(co.drop_eagle_group_ids),
+        num_hash_lookahead_tokens=co.block_pool.num_hash_lookahead_tokens,
+    )
+    junction = getattr(request, "shared_prefix_boundary", 0)
+    InklingConvTailManager._boundaries[request.request_id] = (
+        (*boundaries, junction) if junction else boundaries
+    )
+    return _orig_allocate_slots(self, request, *args, **kwargs)
+
+
+def _conv_tail_kv_cache_config(
+    self: InklingConvState, vllm_config: VllmConfig
+) -> KVCacheLayerConfig:
+    spec = AttentionSpec(
+        block_size=self.block_size,
+        num_kv_heads=self.num_kv_heads,
+        head_size=self.head_size,
+        head_size_v=0,  # all 4 streams packed into head_size
+        dtype=self._dtype,
+    )
+    return InklingConvTailManager.layer_config(
+        spec,
+        sliding_window=self.sliding_window,
+        num_speculative_tokens=vllm_config.num_speculative_tokens,
+        max_in_flight_steps=vllm_config.max_concurrent_batches,
+        num_lookahead_tokens=vllm_config.num_lookahead_tokens,
+    )
+
+
+# On by default; INKLING_CONV_TAIL=0 restores plain sliding window for the conv caches.
+if os.environ.get("INKLING_CONV_TAIL", "1") != "0":
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+
+    InklingConvState.get_kv_cache_config = _conv_tail_kv_cache_config
+    _orig_allocate_slots = KVCacheManager.allocate_slots
+    KVCacheManager.allocate_slots = _conv_tail_allocate_slots
 
 
 @dataclass

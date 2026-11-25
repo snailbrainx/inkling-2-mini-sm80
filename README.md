@@ -41,6 +41,7 @@ it serves a new number of users at once, one reply can start up to about 3 s lat
 | `K` | `4` | how many tokens the DSpark drafter proposes per step (1-7), see below |
 | `LEN` | `262144` | context length |
 | `BATCH` | `12288` | prompt tokens per prefill chunk |
+| `CONV_TAIL` | `1` | `0` returns the short-conv state caches to vLLM's plain sliding-window layout, which holds about 40% of v3's KV cache (see v3 below) |
 | `UTIL` | `0.96` (one GPU), `0.92` (two) | share of GPU memory vLLM may take; lower it if the GPU also drives a display or runs anything else |
 | `CACHE` | `~/.cache/inkling2-sm80` | compiled kernels |
 | `IMAGE` | the tested build, pinned by digest | the patches replace whole files of that build |
@@ -52,6 +53,27 @@ Thinking is controlled through the chat template: `"chat_template_kwargs": {"rea
 off. Even then, as the model card notes, the model still reasons briefly.
 
 ## Results
+
+### v3: the same speed, 2.5 times the KV cache
+
+v3 (25 Nov 2026) changes how the KV cache is laid out, not the maths (see "What the patches do"):
+
+| | v2 | **v3** |
+|---|---:|---:|
+| KV cache, one GPU | 286,563 tokens (1.09x a 262k context) | **705,878 tokens (2.69x)** |
+| KV cache, two GPUs | 418,253 tokens | **1,642,763 tokens (6.27x)** |
+| Four 230k-token prompts sent at once (one GPU) | prefilled one at a time, KV peak 88% | **three at a time**, KV peak 66%, no preemption |
+| Speed, 33 measures (the tests below) | | level: +0.5% geometric mean |
+| Greedy replies to 9 / 22k / 76k / 184k-token prompts | | byte-identical |
+| Prefix caching (a resent prompt, chats sharing a system prompt) | | unchanged |
+
+The speed comparison ran the full test set on four identical GPUs at once, two with each version, then again with the
+versions swapped between GPUs: +0.5% geometric mean over all 33 measures. The one consistent gap, first tokens
+0.03-0.07 s later for 4-8 users whose prompts share a start (the code and lists recipe tests), came from prefix caching
+and is fixed in this release: on a rerun, 8 code users got their first token in 0.10 s on both versions. The speed
+tables below are v2's and hold for v3.
+
+### v2 against v1
 
 One CMP 170HX at 180 W, PCIe Gen2 x16, DSpark k=4, `reasoning_effort: "none"`. v1 and v2 were measured side by side on
 24 Nov 2026, on two identical cards with the same scripts. Each server first ran a throwaway pass of every test, so no
@@ -88,10 +110,11 @@ within that noise. Single runs otherwise vary by about ±5% for one user.
 | Prompt processing, 32k / 128k / 262k | 8,483 / 6,307 / 4,674 | 7,125 / 6,255 / 5,343 |
 | Time to first token at 262k | 55.9 s | 48.7 s |
 | Generation after a 262k prompt | 90 | 117 |
-| KV cache | 286,563 tokens | 418,253 tokens |
+| KV cache, v2 | 286,563 tokens | 418,253 tokens |
+| KV cache, v3 | 705,878 tokens | 1,642,763 tokens |
 
-Two GPUs help one user a little, very long prompts more, and hold half as much again of KV cache. With several users at
-once one GPU is faster, and two one-GPU servers serve twice as many.
+Two GPUs help one user a little, very long prompts more, and (v3) hold 2.3 times the KV cache of one. With several users
+at once one GPU is faster, and two one-GPU servers serve twice as many.
 
 ### Why the kind of text matters
 
@@ -115,8 +138,9 @@ prose the later guesses rarely survive and checking them only costs time. k=4 is
 
 ## Output quality
 
-Every change keeps the same weights and the same maths; only the order of bf16 rounding differs. v2 against v1, same
-prompts, temperature 0:
+Every change keeps the same weights and the same maths; only the order of bf16 rounding differs. v3 changes no arithmetic:
+its greedy replies were byte-identical to v2's (prompts of 9, 22k, 76k and 184k tokens, the long ones asking for codes
+buried in the text, all recalled). v2 against v1, same prompts, temperature 0:
 
 - Perplexity over 16,675 tokens of fixed text: mean negative log-likelihood 0.526 (v2) against 0.527 (v1).
 - 55 multi-step arithmetic word problems: 55 correct on both.
@@ -169,6 +193,26 @@ prompts, temperature 0:
 
 The v2 kernels were tuned with Neon.
 
+**More KV cache, v3** (25 Nov 2026):
+
+- **Short-conv state caches back only the tail of each prefill chunk** (`attention.py`). Inkling keeps the inputs of its
+  short convolutions in 48 paged caches, one per layer pass (24 layers, the middle 12 run three times). vLLM planned them as sliding-window caches with a
+  window of the kernel size, and a sliding-window cache backs a block for every token of a prefill chunk until the
+  chunk is done: a 12,288-token chunk held about 70% of the KV pool across those caches, so two long prompts could not
+  prefill together, and vLLM sized the pool for 1.09 full contexts, although a 113k-token conversation that is
+  decoding holds 11% of it. The convolutions read only the `kernel - 1` positions before a forward's first token from
+  the cache, so these caches now use vLLM's tail-only sliding-window manager, as the DSpark drafter's KV already does:
+  blocks below each chunk's tail stay null.
+- **Prefix caching unchanged.** The windows below the prompt's replay boundaries (where a resent prompt resumes) and
+  below a shared-prefix junction (pinned by vLLM on the second request sharing a prompt prefix) are still backed, so a
+  resent prompt or a third chat with the same system prompt hits the cache as before.
+- **Conv kernels skip writes to the null block** (`ops/sconv.py`, `csrc/inkling_sm80_cuda.cu`): positions below the
+  tail are never read, and without this a whole chunk would write them all to the same lines.
+- `CONV_TAIL=0` restores the previous layout.
+
+The comparison that prompted this was with [inkling-cmp-engine](https://github.com/shanedertrain/inkling-cmp-engine), a
+separate Rust/CUDA engine for this model on the same card, which holds 516k tokens.
+
 **Tried, no gain:**
 
 - int8 drafter weights: the in-kernel conversion costs more than the halved reads save.
@@ -179,6 +223,9 @@ The v2 kernels were tuned with Neon.
 - FlashInfer's causal path beyond 64k of context, and a gated local-prefill epilogue: both slower.
 - 16,384-token prefill chunks: a full 262k context no longer fits.
 - A smaller draft vocabulary: saves up to ~0.7 ms a step, but rare tokens could no longer be drafted.
+- 6,144-token prefill chunks, to fit more KV cache before v3: prompts 4-24% slower (128k: 6,322 against 4,796 tok/s).
+- vLLM's adaptive verification (a verify width per request from the drafter's confidence): this model's short-conv
+  attention backend has no CUDA graphs for varying per-request query lengths, so vLLM refuses to start with it.
 
 `patches/sm80.diff` shows every change against the image's files. `tools/trace_kernels.py` sums kernel time from a
 vLLM torch-profiler trace: start the server with `--profiler-config`, then POST `/start_profile` and `/stop_profile`.
