@@ -15,6 +15,8 @@
 # BATCH  tokens per prefill chunk (default 12288)
 # UTIL   share of GPU memory vLLM may take (default 0.96 on one GPU, 0.92 on two); lower it if the GPU also drives a
 #        display or runs anything else
+# CONV_TAIL  1 (default): the short-conv state caches back only each prefill chunk's tail, which holds about 2.5x
+#        the KV tokens; 0 restores vLLM's plain sliding-window layout for them
 # CACHE  where compiled kernels are kept between runs (default ~/.cache/inkling2-sm80)
 # IMAGE  defaults to the image build these patches were made against (pinned by digest)
 # NAME   container name (default inkling2-sm80)
@@ -28,6 +30,7 @@ BIND="${BIND:-127.0.0.1}"
 K="${K:-4}"
 LEN="${LEN:-262144}"
 BATCH="${BATCH:-12288}"
+CONV_TAIL="${CONV_TAIL:-1}"
 CACHE="${CACHE:-${HOME}/.cache/inkling2-sm80}"
 # vllm/vllm-openai:inkling-2-mini as published 20 Nov 2026 (vLLM 0.1.dev25855+g7cb5dae22). The patches replace whole
 # files of that build; a newer image may need them redone (see patches/sm80.diff).
@@ -67,7 +70,7 @@ exec docker run --rm --name "${NAME:-inkling2-sm80}" \
     -v "${HERE}/site:/sm80site:ro" \
     -v "${EXT}:/sm80ext:ro" \
     "${mounts[@]}" \
-    -e INKLING_SM80=1 -e PYTHONPATH=/sm80site:/sm80ext \
+    -e INKLING_SM80=1 -e INKLING_CONV_TAIL="${CONV_TAIL}" -e PYTHONPATH=/sm80site:/sm80ext \
     -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False \
     -e TRITON_CACHE_DIR=/root/.cache/triton -e HF_HUB_OFFLINE=1 \
     "${IMAGE}" /model \
