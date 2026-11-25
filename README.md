@@ -46,7 +46,12 @@ it serves a new number of users at once, one reply can start up to about 3 s lat
 | `IMAGE` | the tested build, pinned by digest | the patches replace whole files of that build |
 | `NAME` | `inkling2-sm80` | container name, to run several at once |
 
-Any extra arguments are passed to `vllm serve`, e.g. `./run.sh --max-num-seqs 16`.
+Any extra arguments are passed to `vllm serve`, e.g. `./run.sh --max-num-seqs 16`, or for 1M context on a single 64 GB
+card with FP8 KV cache (software E4M3FN storage on sm_80, BF16 draft KV):
+
+```bash
+MODEL=~/models/Inkling-2-Mini LEN=1048576 BATCH=4096 ./run.sh --kv-cache-dtype fp8
+```
 
 Thinking is controlled through the chat template: `"chat_template_kwargs": {"reasoning_effort": "none"}` turns it
 off. Even then, as the model card notes, the model still reasons briefly.
@@ -186,7 +191,9 @@ vLLM torch-profiler trace: start the server with `--profiler-config`, then POST 
 ## Limits
 
 - Text only (`--language-model-only`); the vision tower has not been tried on sm_80.
-- The KV cache is bf16. The FP8 KV path in this code is SM12x only.
+- The default KV cache is bf16. Passing `--kv-cache-dtype fp8` enables unit-scale E4M3FN KV storage on sm_80 (with the
+  DSpark draft cache kept in bf16); at `LEN=1048576 BATCH=4096`, a single 64 GB card holds ~1.6M KV tokens (1.53x 1M
+  context). Larger `BATCH` reserves more sliding-window blocks across the 48 SWA layers.
 - Two GPUs were tested only as a peer-to-peer pair on PCIe Gen2 x16, with `--disable-custom-all-reduce`.
 - Made against the image build of 20 Nov 2026 (vLLM `0.1.dev25855+g7cb5dae22`). Expect to redo the patches when that
   image or upstream vLLM changes these files.

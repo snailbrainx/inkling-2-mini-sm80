@@ -15,7 +15,22 @@
  from .ops.linear import linear
  from .ops.sconv import attention_prologue, shift_rel_proj
  from .sconv import K_STREAM, V_STREAM, Inkling2ShortConv, conv_metadata
-@@ -339,6 +345,15 @@
+@@ -293,9 +299,14 @@
+         supported: tuple[str, ...] = ("auto", "bfloat16")
+         if current_platform.is_device_capability_family(120):
+             supported += ("float16", "fp8", "fp8_e4m3")
++        elif not current_platform.has_device_capability(90):
++            supported += ("fp8", "fp8_e4m3")
+         if cache_dtype not in supported:
+             raise ValueError(f"Inkling2 KV cache dtype must be one of {supported}")
+         self.fp8_kv = cache_dtype in ("fp8", "fp8_e4m3")
++        self._fp8_kv_as_e4m3 = (
++            self.fp8_kv and current_platform.has_device_capability(89)
++        )
+         if cache_dtype == "float16" and vllm_config.speculative_config is not None:
+             raise ValueError("Inkling2 FP16 KV requires speculative decoding disabled")
+         self.kv_cache = torch.tensor([])
+@@ -339,6 +350,15 @@
              return list(projected.split(self.split_sizes, dim=-1)[:6])
          q_side, kv_size = sum(self.split_sizes[:4]), self.split_sizes[4]
          k_end = q_side + kv_size
@@ -31,7 +46,18 @@
          projected = linear(x_q, weight[: sum(self.q_side_splits)])
          k = linear(x_k, weight[q_side:k_end])
          v = linear(x_v, weight[k_end : k_end + kv_size])
-@@ -379,7 +394,39 @@
+@@ -350,8 +370,9 @@
+     def _split_kv_cache(
+         self, kv_cache: torch.Tensor
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+-        if self.fp8_kv:
++        if self._fp8_kv_as_e4m3:
+             # Every loop pass owns byte storage containing unit-scale E4M3 KV.
++            # Below SM89 Triton rejects float8_e4m3fn pointers; keep uint8.
+             kv_cache = kv_cache.view(torch.float8_e4m3fn)
+         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_dim, dim=-1)
+         return (
+@@ -379,7 +400,39 @@
          if self.is_local and x_k is None:
              x_k = x_v = x_q
          assert x_k is not None and x_v is not None
@@ -72,7 +98,7 @@
          output = torch.empty(gate.shape, dtype=q.dtype, device=q.device)
          self._attention(
              positions,
-@@ -389,8 +436,8 @@
+@@ -389,8 +442,8 @@
              sinks,
              k,
              v,
@@ -83,7 +109,7 @@
              tau,
              output,
              pass_idx,
-@@ -588,33 +635,63 @@
+@@ -588,33 +641,63 @@
              num_splits=num_splits,
          )
  
@@ -118,7 +144,7 @@
 +        handled = False
 +        if (
 +            not self.is_local
-+            and not self.fp8_kv
++            and (not self.fp8_kv or not self._fp8_kv_as_e4m3)
 +            and isinstance(md, Inkling2AttentionMetadata)
 +        ):
 +            handled = rel_attention_full_hybrid(
@@ -156,7 +182,7 @@
                  block_table=md.block_table[num_decodes:],
                  cache_seqlens=md.seq_lens[num_decodes:],
                  cu_seqlens_q=cu_seqlens_q,
-@@ -622,8 +699,72 @@
+@@ -622,8 +705,72 @@
                  softmax_scale=self.scaling,
                  window=self.sliding_window if self.is_local else 0,
                  num_splits=1,
@@ -189,7 +215,7 @@
 +            handled = False
 +            if (
 +                not self.is_local
-+                and not self.fp8_kv
++                and (not self.fp8_kv or not self._fp8_kv_as_e4m3)
 +                and isinstance(md, Inkling2AttentionMetadata)
 +            ):
 +                handled = rel_attention_full_hybrid(
@@ -1024,7 +1050,68 @@
      half = tl.arange(0, D // 2)
      pair = tl.load(
          ptr.to(tl.pointer_type(tl.uint16))
-@@ -124,8 +138,6 @@
+@@ -57,6 +71,52 @@
+ 
+ 
+ @triton.jit
++def _load_fp8_kv_u8(ptr, offsets, mask, D: tl.constexpr, EVICT_FIRST: tl.constexpr = False):
++    """Software E4M3 byte decode for SM80: decodes 4 bytes -> 4 fp16 values of x * 2^-8."""
++    offs_d = tl.arange(0, D)
++    if mask is not None:
++        if EVICT_FIRST:
++            tile = tl.load(
++                ptr + offsets[:, None] + offs_d[None, :],
++                mask=mask[:, None],
++                other=0,
++                eviction_policy="evict_first",
++            )
++        else:
++            tile = tl.load(
++                ptr + offsets[:, None] + offs_d[None, :],
++                mask=mask[:, None],
++                other=0,
++            )
++    else:
++        if EVICT_FIRST:
++            tile = tl.load(
++                ptr + offsets[:, None] + offs_d[None, :],
++                eviction_policy="evict_first",
++            )
++        else:
++            tile = tl.load(ptr + offsets[:, None] + offs_d[None, :])
++    return tl.inline_asm_elementwise(
++        asm="""
++        {
++        .reg .b32 rot, high;
++        shf.r.wrap.b32 rot, $2, $2, 1;
++        lop3.b32 high, $2, rot, 0x80808080, 0xE4;
++        prmt.b32 $0, rot, high, 0x5043;
++        prmt.b32 $1, rot, high, 0x7261;
++        and.b32 $0, $0, 0xBF80BF80;
++        and.b32 $1, $1, 0xBF80BF80;
++        }
++        """,
++        constraints="=r,=r,r",
++        args=[tile],
++        dtype=tl.float16,
++        is_pure=True,
++        pack=4,
++    )
++
++
++@triton.jit
+ def _rel_attention_kernel(
+     Q,
+     K,
+@@ -95,6 +155,7 @@
+     MODE: tl.constexpr,
+     BLOCK_M: tl.constexpr,
+     BLOCK_N: tl.constexpr,
++    IS_U8_FP8: tl.constexpr,
+ ):
+     TOKENS: tl.constexpr = BLOCK_M // G
+     E_PAD: tl.constexpr = E + 256
+@@ -124,8 +185,6 @@
          pos = past + tok
          pos_lo = past + first_tok
          pos_hi = past + tl.minimum(first_tok + TOKENS, q_len) - 1
@@ -1033,7 +1120,7 @@
      n_lo = 0
      if WINDOW > 0:
          n_lo = tl.maximum(pos_lo - (WINDOW - 1), 0) // BLOCK_N
-@@ -134,6 +146,7 @@
+@@ -134,6 +193,7 @@
      num_iters = tl.maximum(n_hi - n_lo - split + num_splits - 1, 0) // num_splits
  
      offs_d = tl.arange(0, D)
@@ -1041,7 +1128,14 @@
      q = tl.load(
          Q + token[:, None] * stride_q_t + head[:, None] * stride_q_h + offs_d[None, :],
          mask=row_valid[:, None],
-@@ -150,23 +163,53 @@
+@@ -144,29 +204,65 @@
+         rel_base = (past + tile_end + 127) // 128 * 128 - E_PAD
+         rel_row = Rel + token * stride_rel_t + head * E_PAD - rel_base
+ 
+-    qk_scale = softmax_scale * LOG2E
++    qk_scale = softmax_scale * LOG2E * (256.0 if IS_U8_FP8 else 1.0)
+     m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
+     l_i = tl.zeros([BLOCK_M], tl.float32)
      acc = tl.zeros([BLOCK_M, D], tl.float32)
      block_table = BlockTable + req.to(tl.int64) * stride_bt
      kv_off = kv_head * stride_kv_h
@@ -1054,14 +1148,15 @@
 +            tl.maximum(far_hi - n_lo - split + num_splits - 1, 0) // num_splits, num_iters
 +        )
 +    for i in range(num_far):
-         n = n_lo + split + i * num_splits
--        keys = n * BLOCK_N + tl.arange(0, BLOCK_N)
++        n = n_lo + split + i * num_splits
 +        keys = n * BLOCK_N + offs_n
 +        page = tl.load(block_table + keys // PAGE)
 +        kv_ptrs = (
 +            page.to(tl.int64) * stride_kv_blk + (keys % PAGE) * stride_kv_slot + kv_off
 +        )
-+        if K.dtype.element_ty.primitive_bitwidth == 8:
++        if IS_U8_FP8:
++            k = _load_fp8_kv_u8(K, kv_ptrs, None, D, EVICT_FIRST=True).to(q.dtype)
++        elif K.dtype.element_ty.primitive_bitwidth == 8:
 +            k = _load_fp8_kv(K, kv_ptrs, keys >= 0, q.dtype, D)
 +        else:
 +            # Coalesced 128-bit load along D (stride_d=1), evict_first so long-ctx KV doesn't thrash L2.
@@ -1071,22 +1166,28 @@
 +        alpha = tl.exp2(m_i - m_new)
 +        p = tl.exp2(s - m_new[:, None])
 +        l_i = l_i * alpha + tl.sum(p, 1)
-+        if V.dtype.element_ty.primitive_bitwidth == 8:
++        if IS_U8_FP8:
++            v = _load_fp8_kv_u8(V, kv_ptrs, None, D, EVICT_FIRST=True)
++        elif V.dtype.element_ty.primitive_bitwidth == 8:
 +            v = _load_fp8_kv(V, kv_ptrs, keys >= 0, q.dtype, D)
 +        else:
 +            v = tl.load(V + kv_ptrs[:, None] + offs_d[None, :], eviction_policy="evict_first").to(q.dtype)
 +        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
 +        m_i = m_new
 +    for i in range(num_far, num_iters):
-+        n = n_lo + split + i * num_splits
+         n = n_lo + split + i * num_splits
+-        keys = n * BLOCK_N + tl.arange(0, BLOCK_N)
 +        keys = n * BLOCK_N + offs_n
          key_valid = keys < seqlen_k
          page = tl.load(block_table + keys // PAGE, mask=key_valid, other=0)
          kv_ptrs = (
              page.to(tl.int64) * stride_kv_blk + (keys % PAGE) * stride_kv_slot + kv_off
          )
-         if K.dtype.element_ty.primitive_bitwidth == 8:
+-        if K.dtype.element_ty.primitive_bitwidth == 8:
 -            k = _load_fp8_kv(K, kv_ptrs, key_valid, q.dtype, D).T
++        if IS_U8_FP8:
++            k = _load_fp8_kv_u8(K, kv_ptrs, key_valid, D).to(q.dtype)
++        elif K.dtype.element_ty.primitive_bitwidth == 8:
 +            k = _load_fp8_kv(K, kv_ptrs, key_valid, q.dtype, D)
          else:
              k = tl.load(
@@ -1101,7 +1202,27 @@
          dist = pos[:, None] - keys[None, :]
          visible = (dist >= 0) & key_valid[None, :]
          if WINDOW > 0:
-@@ -231,6 +274,825 @@
+@@ -181,7 +277,9 @@
+         alpha = tl.exp2(m_i - m_safe)
+         p = tl.exp2(s - m_safe[:, None])
+         l_i = l_i * alpha + tl.sum(p, 1)
+-        if V.dtype.element_ty.primitive_bitwidth == 8:
++        if IS_U8_FP8:
++            v = _load_fp8_kv_u8(V, kv_ptrs, key_valid, D)
++        elif V.dtype.element_ty.primitive_bitwidth == 8:
+             v = _load_fp8_kv(V, kv_ptrs, key_valid, q.dtype, D)
+         else:
+             v = tl.load(
+@@ -194,6 +292,8 @@
+ 
+     empty = l_i == 0.0
+     o = acc / tl.where(empty, 1.0, l_i)[:, None]
++    if IS_U8_FP8:
++        o = o * 256.0
+     lse2 = tl.where(empty, float("-inf"), m_i + tl.log2(tl.where(empty, 1.0, l_i)))
+     if MODE == 0:
+         tl.store(
+@@ -231,6 +331,899 @@
          tl.store(Out + part[:, None] * D + offs_d[None, :], o, mask=row_valid[:, None])
  
  
@@ -1136,6 +1257,7 @@
 +    WINDOW: tl.constexpr,
 +    BLOCK_M: tl.constexpr,
 +    BLOCK_N: tl.constexpr,
++    IS_U8_FP8: tl.constexpr,
 +):
 +    """sm_80 fast local-window prefill kernel: splits [n_lo, n_hi) into left boundary,
 +    strictly-interior unmasked blocks, and right boundary (zero-spill OUT_LSE)."""
@@ -1176,7 +1298,7 @@
 +    rel_base = (past + tile_end + 127) // 128 * 128 - E_PAD
 +    rel_row = Rel + token * stride_rel_t + head * E_PAD - rel_base
 +
-+    qk_scale = softmax_scale * LOG2E
++    qk_scale = softmax_scale * LOG2E * (256.0 if IS_U8_FP8 else 1.0)
 +    m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
 +    l_i = tl.zeros([BLOCK_M], tl.float32)
 +    acc = tl.zeros([BLOCK_M, D], tl.float32)
@@ -1195,9 +1317,12 @@
 +        kv_ptrs = (
 +            page.to(tl.int64) * stride_kv_blk + (keys % PAGE) * stride_kv_slot + kv_off
 +        )
-+        k = tl.load(
-+            K + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0
-+        ).to(q.dtype)
++        if IS_U8_FP8:
++            k = _load_fp8_kv_u8(K, kv_ptrs, key_valid, D).to(q.dtype)
++        else:
++            k = tl.load(
++                K + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0
++            ).to(q.dtype)
 +        s = tl.dot(q, tl.trans(k)) * qk_scale
 +        dist = pos[:, None] - keys[None, :]
 +        visible = (dist >= 0) & (dist < WINDOW) & key_valid[None, :]
@@ -1210,9 +1335,12 @@
 +        alpha = tl.exp2(m_i - m_safe)
 +        p = tl.exp2(s - m_safe[:, None])
 +        l_i = l_i * alpha + tl.sum(p, 1)
-+        v = tl.load(
-+            V + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0
-+        ).to(q.dtype)
++        if IS_U8_FP8:
++            v = _load_fp8_kv_u8(V, kv_ptrs, key_valid, D)
++        else:
++            v = tl.load(
++                V + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0
++            ).to(q.dtype)
 +        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
 +        m_i = m_new
 +
@@ -1222,7 +1350,10 @@
 +        kv_ptrs = (
 +            page.to(tl.int64) * stride_kv_blk + (keys % PAGE) * stride_kv_slot + kv_off
 +        )
-+        k = tl.load(K + kv_ptrs[:, None] + offs_d[None, :]).to(q.dtype)
++        if IS_U8_FP8:
++            k = _load_fp8_kv_u8(K, kv_ptrs, None, D).to(q.dtype)
++        else:
++            k = tl.load(K + kv_ptrs[:, None] + offs_d[None, :]).to(q.dtype)
 +        s = tl.dot(q, tl.trans(k)) * qk_scale
 +        bias = tl.load(
 +            rel_row[:, None] + keys[None, :], mask=row_valid[:, None], other=0.0
@@ -1232,7 +1363,10 @@
 +        alpha = tl.exp2(m_i - m_new)
 +        p = tl.exp2(s - m_new[:, None])
 +        l_i = l_i * alpha + tl.sum(p, 1)
-+        v = tl.load(V + kv_ptrs[:, None] + offs_d[None, :]).to(q.dtype)
++        if IS_U8_FP8:
++            v = _load_fp8_kv_u8(V, kv_ptrs, None, D)
++        else:
++            v = tl.load(V + kv_ptrs[:, None] + offs_d[None, :]).to(q.dtype)
 +        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
 +        m_i = m_new
 +
@@ -1243,9 +1377,12 @@
 +        kv_ptrs = (
 +            page.to(tl.int64) * stride_kv_blk + (keys % PAGE) * stride_kv_slot + kv_off
 +        )
-+        k = tl.load(
-+            K + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0
-+        ).to(q.dtype)
++        if IS_U8_FP8:
++            k = _load_fp8_kv_u8(K, kv_ptrs, key_valid, D).to(q.dtype)
++        else:
++            k = tl.load(
++                K + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0
++            ).to(q.dtype)
 +        s = tl.dot(q, tl.trans(k)) * qk_scale
 +        dist = pos[:, None] - keys[None, :]
 +        visible = (dist >= 0) & (dist < WINDOW) & key_valid[None, :]
@@ -1258,14 +1395,19 @@
 +        alpha = tl.exp2(m_i - m_safe)
 +        p = tl.exp2(s - m_safe[:, None])
 +        l_i = l_i * alpha + tl.sum(p, 1)
-+        v = tl.load(
-+            V + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0
-+        ).to(q.dtype)
++        if IS_U8_FP8:
++            v = _load_fp8_kv_u8(V, kv_ptrs, key_valid, D)
++        else:
++            v = tl.load(
++                V + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0
++            ).to(q.dtype)
 +        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
 +        m_i = m_new
 +
 +    empty = l_i == 0.0
 +    o = acc / tl.where(empty, 1.0, l_i)[:, None]
++    if IS_U8_FP8:
++        o = o * 256.0
 +    lse2 = tl.where(empty, float("-inf"), m_i + tl.log2(tl.where(empty, 1.0, l_i)))
 +    tl.store(
 +        Out + token[:, None] * stride_out_t + head[:, None] * stride_out_h + offs_d[None, :],
@@ -1316,6 +1458,7 @@
 +    PAGE: tl.constexpr,
 +    BLOCK_M: tl.constexpr,
 +    BLOCK_N: tl.constexpr,
++    IS_U8_FP8: tl.constexpr,
 +):
 +    """v5b Triton 4-interval interior-split NEAR kernel for full layers (WINDOW=0),
 +    initialized directly from FlashInfer (FarOut, FarLse) with zero extra register pressure."""
@@ -1353,7 +1496,7 @@
 +    rel_base = (past + tile_end + 127) // 128 * 128 - E_PAD
 +    rel_row = Rel + token * stride_rel_t + head * E_PAD - rel_base
 +
-+    qk_scale = softmax_scale * LOG2E
++    qk_scale = softmax_scale * LOG2E * (256.0 if IS_U8_FP8 else 1.0)
 +    far_len_tile = tl.load(FarLens + (q_start + first_tok).to(tl.int64))
 +    if far_len_tile > 0:
 +        n_lo = far_len_tile // BLOCK_N
@@ -1369,7 +1512,7 @@
 +        ).to(tl.float32)
 +        m_i = flse
 +        l_i = tl.where(row_valid & (flse > float("-inf")), 1.0, 0.0)
-+        acc = fout
++        acc = fout * 0.00390625 if IS_U8_FP8 else fout
 +    else:
 +        n_lo = 0
 +        m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
@@ -1388,13 +1531,19 @@
 +        keys = n * BLOCK_N + offs_n
 +        page = tl.load(block_table + keys // PAGE)
 +        kv_ptrs = page.to(tl.int64) * stride_kv_blk + (keys % PAGE) * stride_kv_slot + kv_off
-+        k = tl.load(K + kv_ptrs[:, None] + offs_d[None, :]).to(q.dtype)
++        if IS_U8_FP8:
++            k = _load_fp8_kv_u8(K, kv_ptrs, None, D).to(q.dtype)
++        else:
++            k = tl.load(K + kv_ptrs[:, None] + offs_d[None, :]).to(q.dtype)
 +        s = tl.dot(q, tl.trans(k)) * qk_scale
 +        m_new = tl.maximum(m_i, tl.max(s, 1))
 +        alpha = tl.exp2(m_i - m_new)
 +        p = tl.exp2(s - m_new[:, None])
 +        l_i = l_i * alpha + tl.sum(p, 1)
-+        v = tl.load(V + kv_ptrs[:, None] + offs_d[None, :]).to(q.dtype)
++        if IS_U8_FP8:
++            v = _load_fp8_kv_u8(V, kv_ptrs, None, D)
++        else:
++            v = tl.load(V + kv_ptrs[:, None] + offs_d[None, :]).to(q.dtype)
 +        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
 +        m_i = m_new
 +
@@ -1403,7 +1552,10 @@
 +        key_valid = keys < seqlen_k
 +        page = tl.load(block_table + keys // PAGE, mask=key_valid, other=0)
 +        kv_ptrs = page.to(tl.int64) * stride_kv_blk + (keys % PAGE) * stride_kv_slot + kv_off
-+        k = tl.load(K + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0).to(q.dtype)
++        if IS_U8_FP8:
++            k = _load_fp8_kv_u8(K, kv_ptrs, key_valid, D).to(q.dtype)
++        else:
++            k = tl.load(K + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0).to(q.dtype)
 +        s = tl.dot(q, tl.trans(k)) * qk_scale
 +        dist = pos[:, None] - keys[None, :]
 +        visible = (dist >= 0) & key_valid[None, :]
@@ -1415,7 +1567,10 @@
 +        alpha = tl.exp2(m_i - m_safe)
 +        p = tl.exp2(s - m_safe[:, None])
 +        l_i = l_i * alpha + tl.sum(p, 1)
-+        v = tl.load(V + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0).to(q.dtype)
++        if IS_U8_FP8:
++            v = _load_fp8_kv_u8(V, kv_ptrs, key_valid, D)
++        else:
++            v = tl.load(V + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0).to(q.dtype)
 +        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
 +        m_i = m_new
 +
@@ -1423,7 +1578,10 @@
 +        keys = n * BLOCK_N + offs_n
 +        page = tl.load(block_table + keys // PAGE)
 +        kv_ptrs = page.to(tl.int64) * stride_kv_blk + (keys % PAGE) * stride_kv_slot + kv_off
-+        k = tl.load(K + kv_ptrs[:, None] + offs_d[None, :]).to(q.dtype)
++        if IS_U8_FP8:
++            k = _load_fp8_kv_u8(K, kv_ptrs, None, D).to(q.dtype)
++        else:
++            k = tl.load(K + kv_ptrs[:, None] + offs_d[None, :]).to(q.dtype)
 +        s = tl.dot(q, tl.trans(k)) * qk_scale
 +        bias = tl.load(rel_row[:, None] + keys[None, :], mask=row_valid[:, None], other=0.0)
 +        s += bias.to(tl.float32) * LOG2E
@@ -1431,7 +1589,10 @@
 +        alpha = tl.exp2(m_i - m_new)
 +        p = tl.exp2(s - m_new[:, None])
 +        l_i = l_i * alpha + tl.sum(p, 1)
-+        v = tl.load(V + kv_ptrs[:, None] + offs_d[None, :]).to(q.dtype)
++        if IS_U8_FP8:
++            v = _load_fp8_kv_u8(V, kv_ptrs, None, D)
++        else:
++            v = tl.load(V + kv_ptrs[:, None] + offs_d[None, :]).to(q.dtype)
 +        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
 +        m_i = m_new
 +
@@ -1440,7 +1601,10 @@
 +        key_valid = keys < seqlen_k
 +        page = tl.load(block_table + keys // PAGE, mask=key_valid, other=0)
 +        kv_ptrs = page.to(tl.int64) * stride_kv_blk + (keys % PAGE) * stride_kv_slot + kv_off
-+        k = tl.load(K + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0).to(q.dtype)
++        if IS_U8_FP8:
++            k = _load_fp8_kv_u8(K, kv_ptrs, key_valid, D).to(q.dtype)
++        else:
++            k = tl.load(K + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0).to(q.dtype)
 +        s = tl.dot(q, tl.trans(k)) * qk_scale
 +        dist = pos[:, None] - keys[None, :]
 +        visible = (dist >= 0) & key_valid[None, :]
@@ -1452,12 +1616,17 @@
 +        alpha = tl.exp2(m_i - m_safe)
 +        p = tl.exp2(s - m_safe[:, None])
 +        l_i = l_i * alpha + tl.sum(p, 1)
-+        v = tl.load(V + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0).to(q.dtype)
++        if IS_U8_FP8:
++            v = _load_fp8_kv_u8(V, kv_ptrs, key_valid, D)
++        else:
++            v = tl.load(V + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0).to(q.dtype)
 +        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
 +        m_i = m_new
 +
 +    empty = l_i == 0.0
 +    o = acc / tl.where(empty, 1.0, l_i)[:, None]
++    if IS_U8_FP8:
++        o = o * 256.0
 +    lse2 = tl.where(empty, float("-inf"), m_i + tl.log2(tl.where(empty, 1.0, l_i)))
 +    tl.store(
 +        Out + token[:, None] * stride_out_t + head[:, None] * stride_out_h + offs_d[None, :],
@@ -1508,6 +1677,7 @@
 +    PAGE: tl.constexpr,
 +    BLOCK_M: tl.constexpr,
 +    BLOCK_N: tl.constexpr,
++    IS_U8_FP8: tl.constexpr,
 +):
 +    """Exact NEAR (0 <= dist < E) Triton kernel initialized directly from FlashInfer causal=True FAR (dist >= E).
 +    Only scans the E=1024 window (32 blocks of BN=32, num_stages=5) regardless of chunk length!"""
@@ -1545,7 +1715,7 @@
 +    rel_base = (past + tile_end + 127) // 128 * 128 - E_PAD
 +    rel_row = Rel + token * stride_rel_t + head * E_PAD - rel_base
 +
-+    qk_scale = softmax_scale * LOG2E
++    qk_scale = softmax_scale * LOG2E * (256.0 if IS_U8_FP8 else 1.0)
 +    far_row = tl.load(FarRowIdx + token, mask=row_valid, other=-1).to(tl.int64)
 +    has_far = row_valid & (far_row >= 0)
 +    safe_far = tl.maximum(far_row, 0)
@@ -1561,7 +1731,7 @@
 +    ).to(tl.float32)
 +    m_i = flse
 +    l_i = tl.where(has_far & (flse > float("-inf")), 1.0, 0.0)
-+    acc = fout
++    acc = fout * 0.00390625 if IS_U8_FP8 else fout
 +
 +    n_lo = tl.maximum(pos_lo - (E - 1), 0) // BLOCK_N
 +    n_hi = (tl.minimum(pos_hi + 1, seqlen_k) + BLOCK_N - 1) // BLOCK_N
@@ -1578,7 +1748,10 @@
 +        key_valid = keys < seqlen_k
 +        page = tl.load(block_table + keys // PAGE, mask=key_valid, other=0)
 +        kv_ptrs = page.to(tl.int64) * stride_kv_blk + (keys % PAGE) * stride_kv_slot + kv_off
-+        k = tl.load(K + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0).to(q.dtype)
++        if IS_U8_FP8:
++            k = _load_fp8_kv_u8(K, kv_ptrs, key_valid, D).to(q.dtype)
++        else:
++            k = tl.load(K + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0).to(q.dtype)
 +        s = tl.dot(q, tl.trans(k)) * qk_scale
 +        dist = pos[:, None] - keys[None, :]
 +        visible = (dist >= 0) & (dist < E) & key_valid[None, :]
@@ -1589,7 +1762,10 @@
 +        alpha = tl.exp2(m_i - m_safe)
 +        p = tl.exp2(s - m_safe[:, None])
 +        l_i = l_i * alpha + tl.sum(p, 1)
-+        v = tl.load(V + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0).to(q.dtype)
++        if IS_U8_FP8:
++            v = _load_fp8_kv_u8(V, kv_ptrs, key_valid, D)
++        else:
++            v = tl.load(V + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0).to(q.dtype)
 +        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
 +        m_i = m_new
 +
@@ -1597,7 +1773,10 @@
 +        keys = n * BLOCK_N + offs_n
 +        page = tl.load(block_table + keys // PAGE)
 +        kv_ptrs = page.to(tl.int64) * stride_kv_blk + (keys % PAGE) * stride_kv_slot + kv_off
-+        k = tl.load(K + kv_ptrs[:, None] + offs_d[None, :]).to(q.dtype)
++        if IS_U8_FP8:
++            k = _load_fp8_kv_u8(K, kv_ptrs, None, D).to(q.dtype)
++        else:
++            k = tl.load(K + kv_ptrs[:, None] + offs_d[None, :]).to(q.dtype)
 +        s = tl.dot(q, tl.trans(k)) * qk_scale
 +        bias = tl.load(rel_row[:, None] + keys[None, :], mask=row_valid[:, None], other=0.0)
 +        s += bias.to(tl.float32) * LOG2E
@@ -1605,7 +1784,10 @@
 +        alpha = tl.exp2(m_i - m_new)
 +        p = tl.exp2(s - m_new[:, None])
 +        l_i = l_i * alpha + tl.sum(p, 1)
-+        v = tl.load(V + kv_ptrs[:, None] + offs_d[None, :]).to(q.dtype)
++        if IS_U8_FP8:
++            v = _load_fp8_kv_u8(V, kv_ptrs, None, D)
++        else:
++            v = tl.load(V + kv_ptrs[:, None] + offs_d[None, :]).to(q.dtype)
 +        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
 +        m_i = m_new
 +
@@ -1614,7 +1796,10 @@
 +        key_valid = keys < seqlen_k
 +        page = tl.load(block_table + keys // PAGE, mask=key_valid, other=0)
 +        kv_ptrs = page.to(tl.int64) * stride_kv_blk + (keys % PAGE) * stride_kv_slot + kv_off
-+        k = tl.load(K + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0).to(q.dtype)
++        if IS_U8_FP8:
++            k = _load_fp8_kv_u8(K, kv_ptrs, key_valid, D).to(q.dtype)
++        else:
++            k = tl.load(K + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0).to(q.dtype)
 +        s = tl.dot(q, tl.trans(k)) * qk_scale
 +        dist = pos[:, None] - keys[None, :]
 +        visible = (dist >= 0) & (dist < E) & key_valid[None, :]
@@ -1625,12 +1810,17 @@
 +        alpha = tl.exp2(m_i - m_safe)
 +        p = tl.exp2(s - m_safe[:, None])
 +        l_i = l_i * alpha + tl.sum(p, 1)
-+        v = tl.load(V + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0).to(q.dtype)
++        if IS_U8_FP8:
++            v = _load_fp8_kv_u8(V, kv_ptrs, key_valid, D)
++        else:
++            v = tl.load(V + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0).to(q.dtype)
 +        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
 +        m_i = m_new
 +
 +    empty = l_i == 0.0
 +    o = acc / tl.where(empty, 1.0, l_i)[:, None]
++    if IS_U8_FP8:
++        o = o * 256.0
 +    lse2 = tl.where(empty, float("-inf"), m_i + tl.log2(tl.where(empty, 1.0, l_i)))
 +    tl.store(
 +        Out + token[:, None] * stride_out_t + head[:, None] * stride_out_h + offs_d[None, :],
@@ -1671,7 +1861,7 @@
 +        not current_platform.is_device_capability_family(80)
 +        or os.environ.get("INKLING_SM80_NO_FI_FAR") == "1"
 +        or q.dtype != torch.bfloat16
-+        or kv_cache.dtype != torch.bfloat16
++        or kv_cache.dtype not in (torch.bfloat16, torch.uint8)
 +        or kv_cache.ndim != 4
 +    ):
 +        return False
@@ -1695,7 +1885,9 @@
 +    if plan_cache is None:
 +        plan_cache = {}
 +        md._sm80_fi_plan_cache = plan_cache
-+    plan_key = (num_decodes, num_tokens, num_heads, num_kv_heads, head_dim, page, extent)
++    is_u8_fp8 = kv_cache.dtype == torch.uint8
++    fi_kv_dtype = torch.float8_e4m3fn if is_u8_fp8 else torch.bfloat16
++    plan_key = (num_decodes, num_tokens, num_heads, num_kv_heads, head_dim, page, extent, fi_kv_dtype)
 +    cached = plan_cache.get(plan_key)
 +
 +    if cached is None:
@@ -1758,7 +1950,7 @@
 +                causal=True,
 +                sm_scale=softmax_scale,
 +                q_data_type=torch.bfloat16,
-+                kv_data_type=torch.bfloat16,
++                kv_data_type=fi_kv_dtype,
 +            )
 +            far_row_gpu = torch.from_numpy(far_row_idx).to(q.device, non_blocking=True)
 +            cached = (True, True, fi_wrapper, far_row_gpu, q_ranges)
@@ -1818,7 +2010,7 @@
 +                causal=False,
 +                sm_scale=softmax_scale,
 +                q_data_type=torch.bfloat16,
-+                kv_data_type=torch.bfloat16,
++                kv_data_type=fi_kv_dtype,
 +            )
 +            far_lens_gpu = torch.from_numpy(far_lens_tok).to(q.device, non_blocking=True)
 +            cached = (True, False, fi_wrapper, far_lens_gpu, None)
@@ -1829,7 +2021,8 @@
 +        return False
 +
 +    q_in = q if q.is_contiguous() else q.contiguous()
-+    kc_fi, vc_fi = kv_cache.split(head_dim, dim=-1)
++    kv_fi = kv_cache.view(torch.float8_e4m3fn) if is_u8_fp8 else kv_cache
++    kc_fi, vc_fi = kv_fi.split(head_dim, dim=-1)
 +    assert lse is not None
 +    grid = (triton.cdiv(max_query_len, tokens_per_tile), num_kv_heads, num_reqs)
 +
@@ -1876,6 +2069,7 @@
 +            PAGE=page,
 +            BLOCK_M=128,
 +            BLOCK_N=block_n,
++            IS_U8_FP8=is_u8_fp8,
 +            num_warps=4,
 +            num_stages=5,
 +        )
@@ -1918,6 +2112,7 @@
 +        PAGE=page,
 +        BLOCK_M=128,
 +        BLOCK_N=block_n,
++        IS_U8_FP8=is_u8_fp8,
 +        num_warps=4,
 +        num_stages=5,
 +    )
@@ -1927,7 +2122,7 @@
  def _block_m(max_query_len: int, group: int) -> int:
      rows = max_query_len * group
      return 16 if rows <= 16 else 32 if rows <= 32 else 64 if rows <= 64 else 128
-@@ -255,17 +1117,6 @@
+@@ -255,17 +1248,6 @@
      num_splits: int,
      mode: int,
  ) -> None:
@@ -1945,7 +2140,7 @@
      num_tokens, num_heads, head_dim = q.shape
      page, num_kv_heads = key_cache.shape[1:3]
      group = num_heads // num_kv_heads
-@@ -281,15 +1132,64 @@
+@@ -281,15 +1263,65 @@
      if mode == MODE_GATED and not draft:
          assert gate is not None and sinks is not None
          assert gate.stride(1) == sinks.stride(1) == 1
@@ -1962,7 +2157,7 @@
 +        and not draft
 +        and num_splits == 1
 +        and block_m >= 128
-+        and key_cache.element_size() == 2
++        and key_cache.element_size() in (1, 2)
 +        and current_platform.is_device_capability_family(80)
 +        and lse is not None
 +    ):
@@ -1998,6 +2193,7 @@
 +            WINDOW=window,
 +            BLOCK_M=block_m,
 +            BLOCK_N=64 if _loc_bn64 else 32,
++            IS_U8_FP8=key_cache.dtype == torch.uint8,
 +            num_warps=8 if _loc_bn64 else 4,
 +            num_stages=3 if _loc_bn64 else 5,
 +        )
@@ -2014,7 +2210,7 @@
      grid = (
          triton.cdiv(max_query_len, tokens_per_tile),
          num_kv_heads * num_splits,
-@@ -303,6 +1203,12 @@
+@@ -303,6 +1335,12 @@
      else:
          assert out.is_contiguous() and lse.is_contiguous()
          out_strides = (0, 0, 0, 0)
@@ -2027,7 +2223,7 @@
      _rel_attention_kernel[grid](
          q,
          key_cache,
-@@ -337,7 +1243,7 @@
+@@ -337,7 +1375,8 @@
          DRAFT=draft,
          MODE=mode,
          BLOCK_M=block_m,
@@ -2035,6 +2231,7 @@
 -        num_warps=8 if block_m >= 128 else 4,
 -        num_stages=2,
 +        BLOCK_N=(64 if window else 32) if block_m >= 128 else (128 if ((window or _full_dec_128) and block_m <= 32) else 64),
++        IS_U8_FP8=key_cache.dtype == torch.uint8,
 +        num_warps=(8 if window else 4) if block_m >= 128 else (8 if _full_dec_128 else 4),
 +        num_stages=(3 if window else 4) if block_m >= 128 else 2,
      )
@@ -3793,7 +3990,7 @@
          )
  
  
-@@ -704,6 +706,219 @@
+@@ -704,6 +706,235 @@
  
  
  @triton.jit
@@ -4010,10 +4207,26 @@
 +
 +
 +@triton.jit
++def _f32_to_e4m3_u8(x):
++    """Software IEEE-like FP32 -> E4M3FN (uint8) with RNE for SM80."""
++    xc = tl.minimum(tl.maximum(x, -448.0), 448.0)
++    bits = xc.to(tl.uint32, bitcast=True)
++    sign = (bits >> 24) & 0x80
++    abs_bits = bits & 0x7FFFFFFF
++    abs_x = tl.abs(xc)
++    is_sub = abs_x < 0.015625  # 2^-6: E4M3 min normal
++    sub_code = (abs_x + 16384.0).to(tl.uint32, bitcast=True) & 0xF
++    round_bias = 0x0007FFFF + ((abs_bits >> 20) & 1)
++    norm_code = ((abs_bits + round_bias) - 0x3C000000) >> 20
++    code = tl.minimum(tl.where(is_sub, sub_code, norm_code), 0x7E)
++    return (sign | code).to(tl.uint8)
++
++
++@triton.jit
  def _kv_conv_tile(
      k_ptr,
      v_ptr,
-@@ -745,8 +960,14 @@
+@@ -745,8 +976,14 @@
      D: tl.constexpr,
      DYNAMIC: tl.constexpr,
      BT: tl.constexpr,
@@ -4029,7 +4242,7 @@
      head = tl.program_id(1)
      is_v = tl.program_id(2) == 1
      d_idx = tl.arange(0, D)
-@@ -791,6 +1012,9 @@
+@@ -791,6 +1028,9 @@
          dyn_ptr if DYNAMIC else None,
          stride_dyn,
          D,
@@ -4039,7 +4252,19 @@
      )
      y = y.to(k_ptr.dtype.element_ty).to(tl.float32)
      sum_sq = tl.sum(y * y, axis=1)
-@@ -907,8 +1131,14 @@
+@@ -810,7 +1050,10 @@
+         + head * stride_kv_h
+         + d_idx[None, :]
+     )
+-    tl.store(dst, y.to(cache.dtype.element_ty), mask=(kv_slot >= 0)[:, None])
++    if cache.dtype.element_ty == tl.uint8:
++        tl.store(dst, _f32_to_e4m3_u8(y), mask=(kv_slot >= 0)[:, None])
++    else:
++        tl.store(dst, y.to(cache.dtype.element_ty), mask=(kv_slot >= 0)[:, None])
+ 
+ 
+ # From this many tokens, q/r run in their own launch (8 tokens per program)
+@@ -907,8 +1150,14 @@
      else:
          width = k_weight.shape[1]
          dyn_strides = (0, 0)
@@ -4055,7 +4280,7 @@
      qr_blocks = 1 + (extent + 256) // block_e
      grid = (
          triton.cdiv(num_tokens, block_t),
-@@ -978,39 +1208,128 @@
+@@ -978,39 +1227,128 @@
          BLOCK_E=block_e,
          QR_TOKENS=triton.cdiv(block_t, num_heads),
          FUSE_QR=not qr_tokens,
@@ -4503,3 +4728,21 @@
 +                    logits = self.model.markov_logits(base_logits[:, i], bias)
 +                    prev = self._sample_logits(logits, idx_map[:, i], sample_pos[:, i], i)
              self.draft_tokens[:num_reqs, i] = prev
+--- a/vllm/models/inkling2/speculator_config.py
++++ b/vllm/models/inkling2/speculator_config.py
+@@ -15,10 +15,13 @@
+     @classmethod
+     def adapt_draft_model_config(cls, spec: "SpeculativeConfig") -> None:
+         super().adapt_draft_model_config(spec)
+-        if current_platform.is_device_capability_family(120):
++        if (
++            current_platform.is_device_capability_family(120)
++            or not current_platform.has_device_capability(90)
++        ):
+             # The target's clipped, unit-scale FP8 cache does not describe the
+             # draft's unnormalized values. Keep the draft cache in BF16.
+             if spec.kv_cache_dtype is None:
+                 spec.kv_cache_dtype = "auto"
+             elif spec.kv_cache_dtype not in ("auto", "bfloat16"):
+-                raise ValueError("Inkling2 DSpark on SM12 requires BF16 draft KV")
++                raise ValueError("Inkling2 DSpark on SM80/SM12 requires BF16 draft KV")

@@ -919,6 +919,22 @@ def _qr_rel_tail_kernel(
 
 
 @triton.jit
+def _f32_to_e4m3_u8(x):
+    """Software IEEE-like FP32 -> E4M3FN (uint8) with RNE for SM80."""
+    xc = tl.minimum(tl.maximum(x, -448.0), 448.0)
+    bits = xc.to(tl.uint32, bitcast=True)
+    sign = (bits >> 24) & 0x80
+    abs_bits = bits & 0x7FFFFFFF
+    abs_x = tl.abs(xc)
+    is_sub = abs_x < 0.015625  # 2^-6: E4M3 min normal
+    sub_code = (abs_x + 16384.0).to(tl.uint32, bitcast=True) & 0xF
+    round_bias = 0x0007FFFF + ((abs_bits >> 20) & 1)
+    norm_code = ((abs_bits + round_bias) - 0x3C000000) >> 20
+    code = tl.minimum(tl.where(is_sub, sub_code, norm_code), 0x7E)
+    return (sign | code).to(tl.uint8)
+
+
+@triton.jit
 def _kv_conv_tile(
     k_ptr,
     v_ptr,
@@ -1034,7 +1050,10 @@ def _kv_conv_tile(
         + head * stride_kv_h
         + d_idx[None, :]
     )
-    tl.store(dst, y.to(cache.dtype.element_ty), mask=(kv_slot >= 0)[:, None])
+    if cache.dtype.element_ty == tl.uint8:
+        tl.store(dst, _f32_to_e4m3_u8(y), mask=(kv_slot >= 0)[:, None])
+    else:
+        tl.store(dst, y.to(cache.dtype.element_ty), mask=(kv_slot >= 0)[:, None])
 
 
 # From this many tokens, q/r run in their own launch (8 tokens per program)

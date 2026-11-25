@@ -22,6 +22,7 @@ NVIDIA sm_80 (Ampere) GPUs and to run faster there; patches/sm80.diff shows ever
   models/inkling2/nvidia/ops/sconv.py
   models/inkling2/quant_config.py
   models/inkling2/speculator.py
+  models/inkling2/speculator_config.py
 
 This product includes software from Humming (https://github.com/vllm-project/humming),
 Copyright Humming contributors, licensed under the Apache License, Version 2.0.

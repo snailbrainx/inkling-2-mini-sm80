@@ -71,6 +71,52 @@ def _load_fp8_kv(ptr, offsets, mask, dtype: tl.constexpr, D: tl.constexpr):
 
 
 @triton.jit
+def _load_fp8_kv_u8(ptr, offsets, mask, D: tl.constexpr, EVICT_FIRST: tl.constexpr = False):
+    """Software E4M3 byte decode for SM80: decodes 4 bytes -> 4 fp16 values of x * 2^-8."""
+    offs_d = tl.arange(0, D)
+    if mask is not None:
+        if EVICT_FIRST:
+            tile = tl.load(
+                ptr + offsets[:, None] + offs_d[None, :],
+                mask=mask[:, None],
+                other=0,
+                eviction_policy="evict_first",
+            )
+        else:
+            tile = tl.load(
+                ptr + offsets[:, None] + offs_d[None, :],
+                mask=mask[:, None],
+                other=0,
+            )
+    else:
+        if EVICT_FIRST:
+            tile = tl.load(
+                ptr + offsets[:, None] + offs_d[None, :],
+                eviction_policy="evict_first",
+            )
+        else:
+            tile = tl.load(ptr + offsets[:, None] + offs_d[None, :])
+    return tl.inline_asm_elementwise(
+        asm="""
+        {
+        .reg .b32 rot, high;
+        shf.r.wrap.b32 rot, $2, $2, 1;
+        lop3.b32 high, $2, rot, 0x80808080, 0xE4;
+        prmt.b32 $0, rot, high, 0x5043;
+        prmt.b32 $1, rot, high, 0x7261;
+        and.b32 $0, $0, 0xBF80BF80;
+        and.b32 $1, $1, 0xBF80BF80;
+        }
+        """,
+        constraints="=r,=r,r",
+        args=[tile],
+        dtype=tl.float16,
+        is_pure=True,
+        pack=4,
+    )
+
+
+@triton.jit
 def _rel_attention_kernel(
     Q,
     K,
@@ -109,6 +155,7 @@ def _rel_attention_kernel(
     MODE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    IS_U8_FP8: tl.constexpr,
 ):
     TOKENS: tl.constexpr = BLOCK_M // G
     E_PAD: tl.constexpr = E + 256
@@ -157,7 +204,7 @@ def _rel_attention_kernel(
         rel_base = (past + tile_end + 127) // 128 * 128 - E_PAD
         rel_row = Rel + token * stride_rel_t + head * E_PAD - rel_base
 
-    qk_scale = softmax_scale * LOG2E
+    qk_scale = softmax_scale * LOG2E * (256.0 if IS_U8_FP8 else 1.0)
     m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
     l_i = tl.zeros([BLOCK_M], tl.float32)
     acc = tl.zeros([BLOCK_M, D], tl.float32)
@@ -177,7 +224,9 @@ def _rel_attention_kernel(
         kv_ptrs = (
             page.to(tl.int64) * stride_kv_blk + (keys % PAGE) * stride_kv_slot + kv_off
         )
-        if K.dtype.element_ty.primitive_bitwidth == 8:
+        if IS_U8_FP8:
+            k = _load_fp8_kv_u8(K, kv_ptrs, None, D, EVICT_FIRST=True).to(q.dtype)
+        elif K.dtype.element_ty.primitive_bitwidth == 8:
             k = _load_fp8_kv(K, kv_ptrs, keys >= 0, q.dtype, D)
         else:
             # Coalesced 128-bit load along D (stride_d=1), evict_first so long-ctx KV doesn't thrash L2.
@@ -187,7 +236,9 @@ def _rel_attention_kernel(
         alpha = tl.exp2(m_i - m_new)
         p = tl.exp2(s - m_new[:, None])
         l_i = l_i * alpha + tl.sum(p, 1)
-        if V.dtype.element_ty.primitive_bitwidth == 8:
+        if IS_U8_FP8:
+            v = _load_fp8_kv_u8(V, kv_ptrs, None, D, EVICT_FIRST=True)
+        elif V.dtype.element_ty.primitive_bitwidth == 8:
             v = _load_fp8_kv(V, kv_ptrs, keys >= 0, q.dtype, D)
         else:
             v = tl.load(V + kv_ptrs[:, None] + offs_d[None, :], eviction_policy="evict_first").to(q.dtype)
@@ -201,7 +252,9 @@ def _rel_attention_kernel(
         kv_ptrs = (
             page.to(tl.int64) * stride_kv_blk + (keys % PAGE) * stride_kv_slot + kv_off
         )
-        if K.dtype.element_ty.primitive_bitwidth == 8:
+        if IS_U8_FP8:
+            k = _load_fp8_kv_u8(K, kv_ptrs, key_valid, D).to(q.dtype)
+        elif K.dtype.element_ty.primitive_bitwidth == 8:
             k = _load_fp8_kv(K, kv_ptrs, key_valid, q.dtype, D)
         else:
             k = tl.load(
@@ -224,7 +277,9 @@ def _rel_attention_kernel(
         alpha = tl.exp2(m_i - m_safe)
         p = tl.exp2(s - m_safe[:, None])
         l_i = l_i * alpha + tl.sum(p, 1)
-        if V.dtype.element_ty.primitive_bitwidth == 8:
+        if IS_U8_FP8:
+            v = _load_fp8_kv_u8(V, kv_ptrs, key_valid, D)
+        elif V.dtype.element_ty.primitive_bitwidth == 8:
             v = _load_fp8_kv(V, kv_ptrs, key_valid, q.dtype, D)
         else:
             v = tl.load(
@@ -237,6 +292,8 @@ def _rel_attention_kernel(
 
     empty = l_i == 0.0
     o = acc / tl.where(empty, 1.0, l_i)[:, None]
+    if IS_U8_FP8:
+        o = o * 256.0
     lse2 = tl.where(empty, float("-inf"), m_i + tl.log2(tl.where(empty, 1.0, l_i)))
     if MODE == 0:
         tl.store(
@@ -305,6 +362,7 @@ def _rel_attention_local_prefill_kernel(
     WINDOW: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    IS_U8_FP8: tl.constexpr,
 ):
     """sm_80 fast local-window prefill kernel: splits [n_lo, n_hi) into left boundary,
     strictly-interior unmasked blocks, and right boundary (zero-spill OUT_LSE)."""
@@ -345,7 +403,7 @@ def _rel_attention_local_prefill_kernel(
     rel_base = (past + tile_end + 127) // 128 * 128 - E_PAD
     rel_row = Rel + token * stride_rel_t + head * E_PAD - rel_base
 
-    qk_scale = softmax_scale * LOG2E
+    qk_scale = softmax_scale * LOG2E * (256.0 if IS_U8_FP8 else 1.0)
     m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
     l_i = tl.zeros([BLOCK_M], tl.float32)
     acc = tl.zeros([BLOCK_M, D], tl.float32)
@@ -364,9 +422,12 @@ def _rel_attention_local_prefill_kernel(
         kv_ptrs = (
             page.to(tl.int64) * stride_kv_blk + (keys % PAGE) * stride_kv_slot + kv_off
         )
-        k = tl.load(
-            K + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0
-        ).to(q.dtype)
+        if IS_U8_FP8:
+            k = _load_fp8_kv_u8(K, kv_ptrs, key_valid, D).to(q.dtype)
+        else:
+            k = tl.load(
+                K + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0
+            ).to(q.dtype)
         s = tl.dot(q, tl.trans(k)) * qk_scale
         dist = pos[:, None] - keys[None, :]
         visible = (dist >= 0) & (dist < WINDOW) & key_valid[None, :]
@@ -379,9 +440,12 @@ def _rel_attention_local_prefill_kernel(
         alpha = tl.exp2(m_i - m_safe)
         p = tl.exp2(s - m_safe[:, None])
         l_i = l_i * alpha + tl.sum(p, 1)
-        v = tl.load(
-            V + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0
-        ).to(q.dtype)
+        if IS_U8_FP8:
+            v = _load_fp8_kv_u8(V, kv_ptrs, key_valid, D)
+        else:
+            v = tl.load(
+                V + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0
+            ).to(q.dtype)
         acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
         m_i = m_new
 
@@ -391,7 +455,10 @@ def _rel_attention_local_prefill_kernel(
         kv_ptrs = (
             page.to(tl.int64) * stride_kv_blk + (keys % PAGE) * stride_kv_slot + kv_off
         )
-        k = tl.load(K + kv_ptrs[:, None] + offs_d[None, :]).to(q.dtype)
+        if IS_U8_FP8:
+            k = _load_fp8_kv_u8(K, kv_ptrs, None, D).to(q.dtype)
+        else:
+            k = tl.load(K + kv_ptrs[:, None] + offs_d[None, :]).to(q.dtype)
         s = tl.dot(q, tl.trans(k)) * qk_scale
         bias = tl.load(
             rel_row[:, None] + keys[None, :], mask=row_valid[:, None], other=0.0
@@ -401,7 +468,10 @@ def _rel_attention_local_prefill_kernel(
         alpha = tl.exp2(m_i - m_new)
         p = tl.exp2(s - m_new[:, None])
         l_i = l_i * alpha + tl.sum(p, 1)
-        v = tl.load(V + kv_ptrs[:, None] + offs_d[None, :]).to(q.dtype)
+        if IS_U8_FP8:
+            v = _load_fp8_kv_u8(V, kv_ptrs, None, D)
+        else:
+            v = tl.load(V + kv_ptrs[:, None] + offs_d[None, :]).to(q.dtype)
         acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
         m_i = m_new
 
@@ -412,9 +482,12 @@ def _rel_attention_local_prefill_kernel(
         kv_ptrs = (
             page.to(tl.int64) * stride_kv_blk + (keys % PAGE) * stride_kv_slot + kv_off
         )
-        k = tl.load(
-            K + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0
-        ).to(q.dtype)
+        if IS_U8_FP8:
+            k = _load_fp8_kv_u8(K, kv_ptrs, key_valid, D).to(q.dtype)
+        else:
+            k = tl.load(
+                K + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0
+            ).to(q.dtype)
         s = tl.dot(q, tl.trans(k)) * qk_scale
         dist = pos[:, None] - keys[None, :]
         visible = (dist >= 0) & (dist < WINDOW) & key_valid[None, :]
@@ -427,14 +500,19 @@ def _rel_attention_local_prefill_kernel(
         alpha = tl.exp2(m_i - m_safe)
         p = tl.exp2(s - m_safe[:, None])
         l_i = l_i * alpha + tl.sum(p, 1)
-        v = tl.load(
-            V + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0
-        ).to(q.dtype)
+        if IS_U8_FP8:
+            v = _load_fp8_kv_u8(V, kv_ptrs, key_valid, D)
+        else:
+            v = tl.load(
+                V + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0
+            ).to(q.dtype)
         acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
         m_i = m_new
 
     empty = l_i == 0.0
     o = acc / tl.where(empty, 1.0, l_i)[:, None]
+    if IS_U8_FP8:
+        o = o * 256.0
     lse2 = tl.where(empty, float("-inf"), m_i + tl.log2(tl.where(empty, 1.0, l_i)))
     tl.store(
         Out + token[:, None] * stride_out_t + head[:, None] * stride_out_h + offs_d[None, :],
@@ -485,6 +563,7 @@ def _rel_attention_near_kernel(
     PAGE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    IS_U8_FP8: tl.constexpr,
 ):
     """v5b Triton 4-interval interior-split NEAR kernel for full layers (WINDOW=0),
     initialized directly from FlashInfer (FarOut, FarLse) with zero extra register pressure."""
@@ -522,7 +601,7 @@ def _rel_attention_near_kernel(
     rel_base = (past + tile_end + 127) // 128 * 128 - E_PAD
     rel_row = Rel + token * stride_rel_t + head * E_PAD - rel_base
 
-    qk_scale = softmax_scale * LOG2E
+    qk_scale = softmax_scale * LOG2E * (256.0 if IS_U8_FP8 else 1.0)
     far_len_tile = tl.load(FarLens + (q_start + first_tok).to(tl.int64))
     if far_len_tile > 0:
         n_lo = far_len_tile // BLOCK_N
@@ -538,7 +617,7 @@ def _rel_attention_near_kernel(
         ).to(tl.float32)
         m_i = flse
         l_i = tl.where(row_valid & (flse > float("-inf")), 1.0, 0.0)
-        acc = fout
+        acc = fout * 0.00390625 if IS_U8_FP8 else fout
     else:
         n_lo = 0
         m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
@@ -557,13 +636,19 @@ def _rel_attention_near_kernel(
         keys = n * BLOCK_N + offs_n
         page = tl.load(block_table + keys // PAGE)
         kv_ptrs = page.to(tl.int64) * stride_kv_blk + (keys % PAGE) * stride_kv_slot + kv_off
-        k = tl.load(K + kv_ptrs[:, None] + offs_d[None, :]).to(q.dtype)
+        if IS_U8_FP8:
+            k = _load_fp8_kv_u8(K, kv_ptrs, None, D).to(q.dtype)
+        else:
+            k = tl.load(K + kv_ptrs[:, None] + offs_d[None, :]).to(q.dtype)
         s = tl.dot(q, tl.trans(k)) * qk_scale
         m_new = tl.maximum(m_i, tl.max(s, 1))
         alpha = tl.exp2(m_i - m_new)
         p = tl.exp2(s - m_new[:, None])
         l_i = l_i * alpha + tl.sum(p, 1)
-        v = tl.load(V + kv_ptrs[:, None] + offs_d[None, :]).to(q.dtype)
+        if IS_U8_FP8:
+            v = _load_fp8_kv_u8(V, kv_ptrs, None, D)
+        else:
+            v = tl.load(V + kv_ptrs[:, None] + offs_d[None, :]).to(q.dtype)
         acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
         m_i = m_new
 
@@ -572,7 +657,10 @@ def _rel_attention_near_kernel(
         key_valid = keys < seqlen_k
         page = tl.load(block_table + keys // PAGE, mask=key_valid, other=0)
         kv_ptrs = page.to(tl.int64) * stride_kv_blk + (keys % PAGE) * stride_kv_slot + kv_off
-        k = tl.load(K + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0).to(q.dtype)
+        if IS_U8_FP8:
+            k = _load_fp8_kv_u8(K, kv_ptrs, key_valid, D).to(q.dtype)
+        else:
+            k = tl.load(K + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0).to(q.dtype)
         s = tl.dot(q, tl.trans(k)) * qk_scale
         dist = pos[:, None] - keys[None, :]
         visible = (dist >= 0) & key_valid[None, :]
@@ -584,7 +672,10 @@ def _rel_attention_near_kernel(
         alpha = tl.exp2(m_i - m_safe)
         p = tl.exp2(s - m_safe[:, None])
         l_i = l_i * alpha + tl.sum(p, 1)
-        v = tl.load(V + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0).to(q.dtype)
+        if IS_U8_FP8:
+            v = _load_fp8_kv_u8(V, kv_ptrs, key_valid, D)
+        else:
+            v = tl.load(V + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0).to(q.dtype)
         acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
         m_i = m_new
 
@@ -592,7 +683,10 @@ def _rel_attention_near_kernel(
         keys = n * BLOCK_N + offs_n
         page = tl.load(block_table + keys // PAGE)
         kv_ptrs = page.to(tl.int64) * stride_kv_blk + (keys % PAGE) * stride_kv_slot + kv_off
-        k = tl.load(K + kv_ptrs[:, None] + offs_d[None, :]).to(q.dtype)
+        if IS_U8_FP8:
+            k = _load_fp8_kv_u8(K, kv_ptrs, None, D).to(q.dtype)
+        else:
+            k = tl.load(K + kv_ptrs[:, None] + offs_d[None, :]).to(q.dtype)
         s = tl.dot(q, tl.trans(k)) * qk_scale
         bias = tl.load(rel_row[:, None] + keys[None, :], mask=row_valid[:, None], other=0.0)
         s += bias.to(tl.float32) * LOG2E
@@ -600,7 +694,10 @@ def _rel_attention_near_kernel(
         alpha = tl.exp2(m_i - m_new)
         p = tl.exp2(s - m_new[:, None])
         l_i = l_i * alpha + tl.sum(p, 1)
-        v = tl.load(V + kv_ptrs[:, None] + offs_d[None, :]).to(q.dtype)
+        if IS_U8_FP8:
+            v = _load_fp8_kv_u8(V, kv_ptrs, None, D)
+        else:
+            v = tl.load(V + kv_ptrs[:, None] + offs_d[None, :]).to(q.dtype)
         acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
         m_i = m_new
 
@@ -609,7 +706,10 @@ def _rel_attention_near_kernel(
         key_valid = keys < seqlen_k
         page = tl.load(block_table + keys // PAGE, mask=key_valid, other=0)
         kv_ptrs = page.to(tl.int64) * stride_kv_blk + (keys % PAGE) * stride_kv_slot + kv_off
-        k = tl.load(K + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0).to(q.dtype)
+        if IS_U8_FP8:
+            k = _load_fp8_kv_u8(K, kv_ptrs, key_valid, D).to(q.dtype)
+        else:
+            k = tl.load(K + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0).to(q.dtype)
         s = tl.dot(q, tl.trans(k)) * qk_scale
         dist = pos[:, None] - keys[None, :]
         visible = (dist >= 0) & key_valid[None, :]
@@ -621,12 +721,17 @@ def _rel_attention_near_kernel(
         alpha = tl.exp2(m_i - m_safe)
         p = tl.exp2(s - m_safe[:, None])
         l_i = l_i * alpha + tl.sum(p, 1)
-        v = tl.load(V + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0).to(q.dtype)
+        if IS_U8_FP8:
+            v = _load_fp8_kv_u8(V, kv_ptrs, key_valid, D)
+        else:
+            v = tl.load(V + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0).to(q.dtype)
         acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
         m_i = m_new
 
     empty = l_i == 0.0
     o = acc / tl.where(empty, 1.0, l_i)[:, None]
+    if IS_U8_FP8:
+        o = o * 256.0
     lse2 = tl.where(empty, float("-inf"), m_i + tl.log2(tl.where(empty, 1.0, l_i)))
     tl.store(
         Out + token[:, None] * stride_out_t + head[:, None] * stride_out_h + offs_d[None, :],
@@ -677,6 +782,7 @@ def _rel_attention_near_causal_kernel(
     PAGE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    IS_U8_FP8: tl.constexpr,
 ):
     """Exact NEAR (0 <= dist < E) Triton kernel initialized directly from FlashInfer causal=True FAR (dist >= E).
     Only scans the E=1024 window (32 blocks of BN=32, num_stages=5) regardless of chunk length!"""
@@ -714,7 +820,7 @@ def _rel_attention_near_causal_kernel(
     rel_base = (past + tile_end + 127) // 128 * 128 - E_PAD
     rel_row = Rel + token * stride_rel_t + head * E_PAD - rel_base
 
-    qk_scale = softmax_scale * LOG2E
+    qk_scale = softmax_scale * LOG2E * (256.0 if IS_U8_FP8 else 1.0)
     far_row = tl.load(FarRowIdx + token, mask=row_valid, other=-1).to(tl.int64)
     has_far = row_valid & (far_row >= 0)
     safe_far = tl.maximum(far_row, 0)
@@ -730,7 +836,7 @@ def _rel_attention_near_causal_kernel(
     ).to(tl.float32)
     m_i = flse
     l_i = tl.where(has_far & (flse > float("-inf")), 1.0, 0.0)
-    acc = fout
+    acc = fout * 0.00390625 if IS_U8_FP8 else fout
 
     n_lo = tl.maximum(pos_lo - (E - 1), 0) // BLOCK_N
     n_hi = (tl.minimum(pos_hi + 1, seqlen_k) + BLOCK_N - 1) // BLOCK_N
@@ -747,7 +853,10 @@ def _rel_attention_near_causal_kernel(
         key_valid = keys < seqlen_k
         page = tl.load(block_table + keys // PAGE, mask=key_valid, other=0)
         kv_ptrs = page.to(tl.int64) * stride_kv_blk + (keys % PAGE) * stride_kv_slot + kv_off
-        k = tl.load(K + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0).to(q.dtype)
+        if IS_U8_FP8:
+            k = _load_fp8_kv_u8(K, kv_ptrs, key_valid, D).to(q.dtype)
+        else:
+            k = tl.load(K + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0).to(q.dtype)
         s = tl.dot(q, tl.trans(k)) * qk_scale
         dist = pos[:, None] - keys[None, :]
         visible = (dist >= 0) & (dist < E) & key_valid[None, :]
@@ -758,7 +867,10 @@ def _rel_attention_near_causal_kernel(
         alpha = tl.exp2(m_i - m_safe)
         p = tl.exp2(s - m_safe[:, None])
         l_i = l_i * alpha + tl.sum(p, 1)
-        v = tl.load(V + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0).to(q.dtype)
+        if IS_U8_FP8:
+            v = _load_fp8_kv_u8(V, kv_ptrs, key_valid, D)
+        else:
+            v = tl.load(V + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0).to(q.dtype)
         acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
         m_i = m_new
 
@@ -766,7 +878,10 @@ def _rel_attention_near_causal_kernel(
         keys = n * BLOCK_N + offs_n
         page = tl.load(block_table + keys // PAGE)
         kv_ptrs = page.to(tl.int64) * stride_kv_blk + (keys % PAGE) * stride_kv_slot + kv_off
-        k = tl.load(K + kv_ptrs[:, None] + offs_d[None, :]).to(q.dtype)
+        if IS_U8_FP8:
+            k = _load_fp8_kv_u8(K, kv_ptrs, None, D).to(q.dtype)
+        else:
+            k = tl.load(K + kv_ptrs[:, None] + offs_d[None, :]).to(q.dtype)
         s = tl.dot(q, tl.trans(k)) * qk_scale
         bias = tl.load(rel_row[:, None] + keys[None, :], mask=row_valid[:, None], other=0.0)
         s += bias.to(tl.float32) * LOG2E
@@ -774,7 +889,10 @@ def _rel_attention_near_causal_kernel(
         alpha = tl.exp2(m_i - m_new)
         p = tl.exp2(s - m_new[:, None])
         l_i = l_i * alpha + tl.sum(p, 1)
-        v = tl.load(V + kv_ptrs[:, None] + offs_d[None, :]).to(q.dtype)
+        if IS_U8_FP8:
+            v = _load_fp8_kv_u8(V, kv_ptrs, None, D)
+        else:
+            v = tl.load(V + kv_ptrs[:, None] + offs_d[None, :]).to(q.dtype)
         acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
         m_i = m_new
 
@@ -783,7 +901,10 @@ def _rel_attention_near_causal_kernel(
         key_valid = keys < seqlen_k
         page = tl.load(block_table + keys // PAGE, mask=key_valid, other=0)
         kv_ptrs = page.to(tl.int64) * stride_kv_blk + (keys % PAGE) * stride_kv_slot + kv_off
-        k = tl.load(K + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0).to(q.dtype)
+        if IS_U8_FP8:
+            k = _load_fp8_kv_u8(K, kv_ptrs, key_valid, D).to(q.dtype)
+        else:
+            k = tl.load(K + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0).to(q.dtype)
         s = tl.dot(q, tl.trans(k)) * qk_scale
         dist = pos[:, None] - keys[None, :]
         visible = (dist >= 0) & (dist < E) & key_valid[None, :]
@@ -794,12 +915,17 @@ def _rel_attention_near_causal_kernel(
         alpha = tl.exp2(m_i - m_safe)
         p = tl.exp2(s - m_safe[:, None])
         l_i = l_i * alpha + tl.sum(p, 1)
-        v = tl.load(V + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0).to(q.dtype)
+        if IS_U8_FP8:
+            v = _load_fp8_kv_u8(V, kv_ptrs, key_valid, D)
+        else:
+            v = tl.load(V + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0).to(q.dtype)
         acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
         m_i = m_new
 
     empty = l_i == 0.0
     o = acc / tl.where(empty, 1.0, l_i)[:, None]
+    if IS_U8_FP8:
+        o = o * 256.0
     lse2 = tl.where(empty, float("-inf"), m_i + tl.log2(tl.where(empty, 1.0, l_i)))
     tl.store(
         Out + token[:, None] * stride_out_t + head[:, None] * stride_out_h + offs_d[None, :],
@@ -840,7 +966,7 @@ def rel_attention_full_hybrid(
         not current_platform.is_device_capability_family(80)
         or os.environ.get("INKLING_SM80_NO_FI_FAR") == "1"
         or q.dtype != torch.bfloat16
-        or kv_cache.dtype != torch.bfloat16
+        or kv_cache.dtype not in (torch.bfloat16, torch.uint8)
         or kv_cache.ndim != 4
     ):
         return False
@@ -864,7 +990,9 @@ def rel_attention_full_hybrid(
     if plan_cache is None:
         plan_cache = {}
         md._sm80_fi_plan_cache = plan_cache
-    plan_key = (num_decodes, num_tokens, num_heads, num_kv_heads, head_dim, page, extent)
+    is_u8_fp8 = kv_cache.dtype == torch.uint8
+    fi_kv_dtype = torch.float8_e4m3fn if is_u8_fp8 else torch.bfloat16
+    plan_key = (num_decodes, num_tokens, num_heads, num_kv_heads, head_dim, page, extent, fi_kv_dtype)
     cached = plan_cache.get(plan_key)
 
     if cached is None:
@@ -927,7 +1055,7 @@ def rel_attention_full_hybrid(
                 causal=True,
                 sm_scale=softmax_scale,
                 q_data_type=torch.bfloat16,
-                kv_data_type=torch.bfloat16,
+                kv_data_type=fi_kv_dtype,
             )
             far_row_gpu = torch.from_numpy(far_row_idx).to(q.device, non_blocking=True)
             cached = (True, True, fi_wrapper, far_row_gpu, q_ranges)
@@ -987,7 +1115,7 @@ def rel_attention_full_hybrid(
                 causal=False,
                 sm_scale=softmax_scale,
                 q_data_type=torch.bfloat16,
-                kv_data_type=torch.bfloat16,
+                kv_data_type=fi_kv_dtype,
             )
             far_lens_gpu = torch.from_numpy(far_lens_tok).to(q.device, non_blocking=True)
             cached = (True, False, fi_wrapper, far_lens_gpu, None)
@@ -998,7 +1126,8 @@ def rel_attention_full_hybrid(
         return False
 
     q_in = q if q.is_contiguous() else q.contiguous()
-    kc_fi, vc_fi = kv_cache.split(head_dim, dim=-1)
+    kv_fi = kv_cache.view(torch.float8_e4m3fn) if is_u8_fp8 else kv_cache
+    kc_fi, vc_fi = kv_fi.split(head_dim, dim=-1)
     assert lse is not None
     grid = (triton.cdiv(max_query_len, tokens_per_tile), num_kv_heads, num_reqs)
 
@@ -1045,6 +1174,7 @@ def rel_attention_full_hybrid(
             PAGE=page,
             BLOCK_M=128,
             BLOCK_N=block_n,
+            IS_U8_FP8=is_u8_fp8,
             num_warps=4,
             num_stages=5,
         )
@@ -1087,6 +1217,7 @@ def rel_attention_full_hybrid(
         PAGE=page,
         BLOCK_M=128,
         BLOCK_N=block_n,
+        IS_U8_FP8=is_u8_fp8,
         num_warps=4,
         num_stages=5,
     )
@@ -1144,7 +1275,7 @@ def rel_attention(
         and not draft
         and num_splits == 1
         and block_m >= 128
-        and key_cache.element_size() == 2
+        and key_cache.element_size() in (1, 2)
         and current_platform.is_device_capability_family(80)
         and lse is not None
     ):
@@ -1180,6 +1311,7 @@ def rel_attention(
             WINDOW=window,
             BLOCK_M=block_m,
             BLOCK_N=64 if _loc_bn64 else 32,
+            IS_U8_FP8=key_cache.dtype == torch.uint8,
             num_warps=8 if _loc_bn64 else 4,
             num_stages=3 if _loc_bn64 else 5,
         )
@@ -1244,6 +1376,7 @@ def rel_attention(
         MODE=mode,
         BLOCK_M=block_m,
         BLOCK_N=(64 if window else 32) if block_m >= 128 else (128 if ((window or _full_dec_128) and block_m <= 32) else 64),
+        IS_U8_FP8=key_cache.dtype == torch.uint8,
         num_warps=(8 if window else 4) if block_m >= 128 else (8 if _full_dec_128 else 4),
         num_stages=(3 if window else 4) if block_m >= 128 else 2,
     )

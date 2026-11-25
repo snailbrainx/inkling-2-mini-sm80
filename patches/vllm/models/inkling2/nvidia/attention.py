@@ -299,9 +299,14 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         supported: tuple[str, ...] = ("auto", "bfloat16")
         if current_platform.is_device_capability_family(120):
             supported += ("float16", "fp8", "fp8_e4m3")
+        elif not current_platform.has_device_capability(90):
+            supported += ("fp8", "fp8_e4m3")
         if cache_dtype not in supported:
             raise ValueError(f"Inkling2 KV cache dtype must be one of {supported}")
         self.fp8_kv = cache_dtype in ("fp8", "fp8_e4m3")
+        self._fp8_kv_as_e4m3 = (
+            self.fp8_kv and current_platform.has_device_capability(89)
+        )
         if cache_dtype == "float16" and vllm_config.speculative_config is not None:
             raise ValueError("Inkling2 FP16 KV requires speculative decoding disabled")
         self.kv_cache = torch.tensor([])
@@ -365,8 +370,9 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
     def _split_kv_cache(
         self, kv_cache: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.fp8_kv:
+        if self._fp8_kv_as_e4m3:
             # Every loop pass owns byte storage containing unit-scale E4M3 KV.
+            # Below SM89 Triton rejects float8_e4m3fn pointers; keep uint8.
             kv_cache = kv_cache.view(torch.float8_e4m3fn)
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_dim, dim=-1)
         return (
@@ -659,7 +665,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         handled = False
         if (
             not self.is_local
-            and not self.fp8_kv
+            and (not self.fp8_kv or not self._fp8_kv_as_e4m3)
             and isinstance(md, Inkling2AttentionMetadata)
         ):
             handled = rel_attention_full_hybrid(
@@ -727,7 +733,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
             handled = False
             if (
                 not self.is_local
-                and not self.fp8_kv
+                and (not self.fp8_kv or not self._fp8_kv_as_e4m3)
                 and isinstance(md, Inkling2AttentionMetadata)
             ):
                 handled = rel_attention_full_hybrid(
